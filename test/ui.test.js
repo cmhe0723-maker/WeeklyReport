@@ -170,6 +170,11 @@ async function handleSupabase(route) {
   const m = url.pathname.match(/^\/rest\/v1\/(rpc\/)?(\w+)$/);
   if (!m) return json(404, { message: 'not found' });
   if (m[1]) return json(200, rpc(m[2], JSON.parse(req.postData() || '{}'), uid));
+  // 與 PostgREST 相同：profiles↔departments、reports↔profiles 都有兩條關聯，嵌入時必須指定外鍵
+  const select = url.searchParams.get('select') || '';
+  if (/(^|[^!\w])(departments|profiles)\(/.test(select)) {
+    return json(300, { code: 'PGRST201', message: 'Could not embed because more than one relationship was found' });
+  }
   const rows = applyQuery(visible(m[2], uid), url.searchParams);
   if (req.method() === 'HEAD') return route.fulfill({ status: 200, headers: { ...cors, 'content-range': `*/${rows.length}` } });
   if ((req.headers()['accept'] || '').includes('vnd.pgrst.object')) {

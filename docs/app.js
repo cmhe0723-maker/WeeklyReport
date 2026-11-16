@@ -204,7 +204,7 @@
     const { data } = await sb.auth.getSession();
     if (!data.session) return null;
     const profile = must(await sb.from('profiles')
-      .select('id, username, name, role, department_id, active, must_change_password, department:departments(name)')
+      .select('id, username, name, role, department_id, active, must_change_password, department:departments!profiles_department_id_fkey(name)')
       .eq('id', data.session.user.id).maybeSingle());
     myManaged = [];
     if (profile && profile.active && profile.role === 'manager') {
@@ -354,7 +354,7 @@
   /* ------------------------------------------------------------------ 檢視週報 */
   async function pageReportView(id, query) {
     const report = must(await sb.from('reports')
-      .select('*, author:profiles!reports_user_id_fkey(name, department_id, department:departments(name))')
+      .select('*, author:profiles!reports_user_id_fkey(name, department_id, department:departments!profiles_department_id_fkey(name))')
       .eq('id', id).maybeSingle());
     if (!report) return notFound();
     const logs = must(await sb.from('review_logs').select('action, comment, user_name, created_at').eq('report_id', id).order('id', { ascending: false }));
