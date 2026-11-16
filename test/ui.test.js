@@ -225,6 +225,8 @@ test('未登入導向登入頁、密碼錯誤顯示訊息', async () => {
   await page.goto(base + '#/review');
   await page.waitForSelector('input[name=username]');
   assert.match(page.url(), /#\/login\?next=%2Freview/);
+  assert.strictEqual(await page.textContent('.login h1'), '工作週報系統');
+  assert.strictEqual(await page.title(), '工作週報系統');
   await page.fill('input[name=username]', 'amy');
   await page.fill('input[name=password]', 'wrong');
   await page.click('button.btn-primary');
