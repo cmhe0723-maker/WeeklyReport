@@ -2,7 +2,9 @@
 -- 業務週報系統 — Supabase (PostgreSQL) 建表 SQL
 -- 對應程式：src/db.js（原 SQLite 結構）
 --
--- 使用方式：貼到 Supabase Dashboard → SQL Editor 執行，或 `psql -f supabase/schema.sql`
+-- 使用方式（擇一）：
+--   1. 貼到 Supabase Dashboard → SQL Editor 執行
+--   2. 設定 DATABASE_URL 後執行 `npm run db:migrate`
 -- 可重複執行（皆使用 IF NOT EXISTS / OR REPLACE）。
 --
 -- 存取設計：
@@ -173,10 +175,20 @@ alter table public.sessions            enable row level security;
 alter table public.settings            enable row level security;
 
 -- 額外保險：撤銷前端金鑰角色的直接權限（含密碼雜湊、session 等敏感資料）
-revoke all on public.departments, public.users, public.manager_departments,
-              public.reports, public.review_logs, public.sessions, public.settings
-  from anon, authenticated;
-revoke all on function public.set_updated_at() from anon, authenticated;
+-- 僅在 Supabase 角色存在時執行，讓本檔也能用於一般 PostgreSQL（本機開發／測試）
+do $$
+declare r text;
+begin
+  foreach r in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format(
+        'revoke all on public.departments, public.users, public.manager_departments, '
+        'public.reports, public.review_logs, public.sessions, public.settings from %I', r);
+      execute format('revoke all on function public.set_updated_at() from %I', r);
+    end if;
+  end loop;
+end
+$$;
 
 commit;
 

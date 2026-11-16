@@ -1,7 +1,7 @@
 'use strict';
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { db } = require('../db');
+const db = require('../db');
 const { requireLogin, flash } = require('../auth');
 
 const router = express.Router();
@@ -20,7 +20,7 @@ router.get('/login', (req, res) => {
   res.render('login', { title: '登入', error: null, username: '', next: safeNext(req.query.next) });
 });
 
-router.post('/login', (req, res, next) => {
+router.post('/login', async (req, res, next) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const nextUrl = safeNext(req.body.next);
@@ -31,8 +31,8 @@ router.post('/login', (req, res, next) => {
   if (f && f.count >= MAX_FAILS && Date.now() - f.last < LOCK_MS) {
     return fail('登入失敗次數過多，請 15 分鐘後再試。');
   }
-  const user = db.prepare('SELECT id, password_hash, active FROM users WHERE username = ?').get(username);
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+  const user = await db.one('select id, password_hash, active from users where lower(username) = lower($1)', [username]);
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     const cur = f && Date.now() - f.last < LOCK_MS ? f : { count: 0 };
     failures.set(key, { count: cur.count + 1, last: Date.now() });
     return fail('帳號或密碼錯誤。');
@@ -58,16 +58,16 @@ router.get('/account/password', requireLogin, (req, res) => {
   res.render('password', { title: '變更密碼', error: null });
 });
 
-router.post('/account/password', requireLogin, (req, res) => {
+router.post('/account/password', requireLogin, async (req, res) => {
   const { current, password, confirm } = req.body;
-  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  const row = await db.one('select password_hash from users where id = $1', [req.user.id]);
   const err = (msg) => res.status(400).render('password', { title: '變更密碼', error: msg });
-  if (!bcrypt.compareSync(String(current || ''), row.password_hash)) return err('目前密碼不正確。');
+  if (!(await bcrypt.compare(String(current || ''), row.password_hash))) return err('目前密碼不正確。');
   if (String(password || '').length < 8) return err('新密碼至少需 8 個字元。');
   if (password !== confirm) return err('兩次輸入的新密碼不一致。');
   if (password === current) return err('新密碼不可與目前密碼相同。');
-  db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?')
-    .run(bcrypt.hashSync(password, 10), req.user.id);
+  await db.query('update users set password_hash = $1, must_change_password = false where id = $2',
+    [await bcrypt.hash(password, 10), req.user.id]);
   flash(req, 'success', '密碼已更新。');
   res.redirect('/');
 });

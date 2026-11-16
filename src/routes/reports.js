@@ -1,6 +1,6 @@
 'use strict';
 const express = require('express');
-const { db, nowIso, transaction } = require('../db');
+const db = require('../db');
 const { requireLogin, requireRole, canView, canReview, flash } = require('../auth');
 const util = require('../util');
 
@@ -8,54 +8,58 @@ const router = express.Router();
 const FIELDS = ['work_summary', 'customer_visits', 'sales_progress', 'next_week_plan', 'issues'];
 const MAX_LEN = 10000;
 
-const reportStmt = db.prepare(
-  `SELECT r.*, u.name AS author_name, u.username AS author_username, u.department_id AS author_department_id,
-          d.name AS department_name, rv.name AS reviewer_name
-   FROM reports r
-   JOIN users u ON u.id = r.user_id
-   LEFT JOIN departments d ON d.id = u.department_id
-   LEFT JOIN users rv ON rv.id = r.reviewed_by
-   WHERE r.id = ?`
-);
 function getReport(id) {
-  return reportStmt.get(Number(id) || 0);
+  const n = Number(id);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  return db.one(
+    `select r.*, u.name as author_name, u.username as author_username, u.department_id as author_department_id,
+            d.name as department_name, rv.name as reviewer_name
+     from reports r
+     join users u on u.id = r.user_id
+     left join departments d on d.id = u.department_id
+     left join users rv on rv.id = r.reviewed_by
+     where r.id = $1`,
+    [n]
+  );
 }
 
 const writers = requireRole('staff', 'manager');
 
 // 我的週報列表
-router.get('/reports', writers, (req, res) => {
-  const reports = db.prepare(
-    `SELECT r.id, r.week_start, r.status, r.submitted_at, r.updated_at, r.reviewed_at, r.review_comment, rv.name AS reviewer_name
-     FROM reports r LEFT JOIN users rv ON rv.id = r.reviewed_by
-     WHERE r.user_id = ? ORDER BY r.week_start DESC`
-  ).all(req.user.id);
+router.get('/reports', writers, async (req, res) => {
+  const reports = await db.query(
+    `select r.id, r.week_start, r.status, r.submitted_at, r.updated_at, r.reviewed_at, r.review_comment, rv.name as reviewer_name
+     from reports r left join users rv on rv.id = r.reviewed_by
+     where r.user_id = $1 order by r.week_start desc`,
+    [req.user.id]
+  );
   const thisWeek = util.currentWeekStart();
-  const thisWeekReport = reports.find(r => r.week_start === thisWeek) || null;
+  const thisWeekReport = reports.find((r) => r.week_start === thisWeek) || null;
   res.render('reports/mine', { title: '我的週報', reports, thisWeek, thisWeekReport });
 });
 
 // 新增（指定週次）：若已存在則導向編輯
-router.get('/reports/new', writers, (req, res) => {
+router.get('/reports/new', writers, async (req, res) => {
   const week = util.weekStartOf(String(req.query.week || '')) || util.currentWeekStart();
-  const existing = db.prepare('SELECT id FROM reports WHERE user_id = ? AND week_start = ?').get(req.user.id, week);
+  const existing = await db.one('select id from reports where user_id = $1 and week_start = $2', [req.user.id, week]);
   if (existing) return res.redirect(`/reports/${existing.id}/edit`);
-  renderForm(res, req.user, { id: null, week_start: week, status: 'draft' }, null);
+  await renderForm(res, req.user, { id: null, week_start: week, status: 'draft' }, null);
 });
 
 function previousPlan(userId, week) {
-  return db.prepare(
-    `SELECT week_start, next_week_plan FROM reports
-     WHERE user_id = ? AND week_start < ? AND next_week_plan <> '' ORDER BY week_start DESC LIMIT 1`
-  ).get(userId, week) || null;
+  return db.one(
+    `select week_start, next_week_plan from reports
+     where user_id = $1 and week_start < $2 and next_week_plan <> '' order by week_start desc limit 1`,
+    [userId, week]
+  );
 }
 
-function renderForm(res, user, report, error, status = 200) {
+async function renderForm(res, user, report, error, status = 200) {
   res.status(status).render('reports/form', {
     title: report.id ? '編輯週報' : '填寫週報',
     report,
     error,
-    prev: previousPlan(user.id, report.week_start),
+    prev: await previousPlan(user.id, report.week_start),
   });
 }
 
@@ -65,37 +69,38 @@ function readFields(body) {
   return out;
 }
 
-router.post('/reports', writers, (req, res) => {
+router.post('/reports', writers, async (req, res) => {
   const week = util.weekStartOf(String(req.body.week_start || ''));
   const fields = readFields(req.body);
   const submit = req.body.action === 'submit';
   const draft = { id: null, week_start: week || util.currentWeekStart(), status: 'draft', ...fields };
   if (!week) return renderForm(res, req.user, draft, '請選擇正確的週次日期。', 400);
   if (submit && !fields.work_summary) return renderForm(res, req.user, draft, '提交前請填寫「本週工作內容」。', 400);
-  const exists = db.prepare('SELECT id FROM reports WHERE user_id = ? AND week_start = ?').get(req.user.id, week);
-  if (exists) return renderForm(res, req.user, draft, `${util.weekLabel(week)} 已有週報，請改為編輯該份週報。`, 409);
 
-  const now = nowIso();
-  const info = db.prepare(
-    `INSERT INTO reports (user_id, week_start, ${FIELDS.join(', ')}, status, submitted_at, created_at, updated_at)
-     VALUES (?, ?, ${FIELDS.map(() => '?').join(', ')}, ?, ?, ?, ?)`
-  ).run(req.user.id, week, ...FIELDS.map(f => fields[f]), submit ? 'submitted' : 'draft', submit ? now : null, now, now);
+  const row = await db.one(
+    `insert into reports (user_id, week_start, ${FIELDS.join(', ')}, status, submitted_at)
+     values ($1, $2, ${FIELDS.map((_, i) => `$${i + 3}`).join(', ')}, $8, $9)
+     on conflict (user_id, week_start) do nothing
+     returning id`,
+    [req.user.id, week, ...FIELDS.map((f) => fields[f]), submit ? 'submitted' : 'draft', submit ? new Date() : null]
+  );
+  if (!row) return renderForm(res, req.user, draft, `${util.weekLabel(week)} 已有週報，請改為編輯該份週報。`, 409);
   flash(req, 'success', submit ? '週報已提交，等待主管查閱。' : '草稿已儲存。');
-  res.redirect(`/reports/${info.lastInsertRowid}`);
+  res.redirect(`/reports/${row.id}`);
 });
 
-router.get('/reports/:id/edit', writers, (req, res) => {
-  const report = getReport(req.params.id);
+router.get('/reports/:id/edit', writers, async (req, res) => {
+  const report = await getReport(req.params.id);
   if (!report || report.user_id !== req.user.id) return notFound(res);
   if (report.reviewed_at) {
     flash(req, 'warning', '此週報主管已查閱，無法再修改。如需修改請洽主管撤回查閱。');
     return res.redirect(`/reports/${report.id}`);
   }
-  renderForm(res, req.user, report, null);
+  await renderForm(res, req.user, report, null);
 });
 
-router.post('/reports/:id', writers, (req, res) => {
-  const report = getReport(req.params.id);
+router.post('/reports/:id', writers, async (req, res) => {
+  const report = await getReport(req.params.id);
   if (!report || report.user_id !== req.user.id) return notFound(res);
   if (report.reviewed_at) {
     flash(req, 'warning', '此週報主管已查閱，無法再修改。');
@@ -106,73 +111,76 @@ router.post('/reports/:id', writers, (req, res) => {
   if (submit && !fields.work_summary) {
     return renderForm(res, req.user, { ...report, ...fields }, '提交前請填寫「本週工作內容」。', 400);
   }
-  const now = nowIso();
-  db.prepare(
-    `UPDATE reports SET ${FIELDS.map(f => `${f} = ?`).join(', ')}, status = ?, submitted_at = ?, updated_at = ?
-     WHERE id = ? AND reviewed_at IS NULL`
-  ).run(...FIELDS.map(f => fields[f]), submit ? 'submitted' : 'draft',
-    submit ? (report.submitted_at || now) : null, now, report.id);
-  flash(req, 'success', submit ? '週報已更新並提交。' : '草稿已儲存。');
+  // reviewed_at is null：避免在主管剛好標記查閱的同時被覆寫
+  const updated = await db.one(
+    `update reports set ${FIELDS.map((f, i) => `${f} = $${i + 1}`).join(', ')}, status = $6, submitted_at = $7
+     where id = $8 and reviewed_at is null returning id`,
+    [...FIELDS.map((f) => fields[f]), submit ? 'submitted' : 'draft',
+      submit ? (report.submitted_at || new Date()) : null, report.id]
+  );
+  if (!updated) flash(req, 'warning', '此週報主管已查閱，無法再修改。');
+  else flash(req, 'success', submit ? '週報已更新並提交。' : '草稿已儲存。');
   res.redirect(`/reports/${report.id}`);
 });
 
-router.post('/reports/:id/delete', writers, (req, res) => {
-  const report = getReport(req.params.id);
+router.post('/reports/:id/delete', writers, async (req, res) => {
+  const report = await getReport(req.params.id);
   if (!report || report.user_id !== req.user.id) return notFound(res);
-  if (report.status !== 'draft') {
+  const deleted = await db.one("delete from reports where id = $1 and status = 'draft' returning id", [report.id]);
+  if (!deleted) {
     flash(req, 'warning', '只有草稿可以刪除。');
     return res.redirect(`/reports/${report.id}`);
   }
-  db.prepare('DELETE FROM reports WHERE id = ?').run(report.id);
   flash(req, 'success', '草稿已刪除。');
   res.redirect('/reports');
 });
 
 // 檢視週報（本人或有權限的主管／管理員）
-router.get('/reports/:id', requireLogin, (req, res) => {
-  const report = getReport(req.params.id);
-  if (!report || !canView(req.user, report)) return notFound(res);
-  const logs = db.prepare(
-    `SELECT l.action, l.comment, l.created_at, u.name AS user_name FROM review_logs l
-     LEFT JOIN users u ON u.id = l.user_id WHERE l.report_id = ? ORDER BY l.id DESC`
-  ).all(report.id);
+router.get('/reports/:id', requireLogin, async (req, res) => {
+  const report = await getReport(req.params.id);
+  if (!report || !(await canView(req.user, report))) return notFound(res);
+  const logs = await db.query(
+    `select l.action, l.comment, l.created_at, u.name as user_name from review_logs l
+     left join users u on u.id = l.user_id where l.report_id = $1 order by l.id desc`,
+    [report.id]
+  );
   if (report.user_id !== req.user.id) res.locals.path = '/review'; // 導覽列標示「週報查閱」
   res.render('reports/view', {
     title: `${report.author_name} 的週報`,
     report,
     logs,
-    canReview: canReview(req.user, report),
+    canReview: await canReview(req.user, report),
     isOwner: report.user_id === req.user.id,
     backUrl: safeBack(req.query.back) || (report.user_id === req.user.id ? '/reports' : '/review'),
   });
 });
 
 // 主管查閱：標記已查閱／撤回／僅留言
-router.post('/reports/:id/review', requireRole('admin', 'manager'), (req, res) => {
-  const report = getReport(req.params.id);
-  if (!report || !canReview(req.user, report)) return notFound(res);
+router.post('/reports/:id/review', requireRole('admin', 'manager'), async (req, res) => {
+  const report = await getReport(req.params.id);
+  if (!report || !(await canReview(req.user, report))) return notFound(res);
   const comment = String(req.body.comment || '').trim().slice(0, 2000);
   const action = req.body.action;
-  const now = nowIso();
   const back = safeBack(req.body.back);
   const backQs = back ? `?back=${encodeURIComponent(back)}` : '';
 
-  transaction(() => {
+  await db.tx(async (t) => {
+    const log = (a) => t.query(
+      'insert into review_logs (report_id, user_id, action, comment) values ($1, $2, $3, $4)',
+      [report.id, req.user.id, a, comment]
+    );
     if (action === 'review') {
-      db.prepare('UPDATE reports SET reviewed_by = ?, reviewed_at = ?, review_comment = ? WHERE id = ?')
-        .run(req.user.id, now, comment, report.id);
-      db.prepare("INSERT INTO review_logs (report_id, user_id, action, comment, created_at) VALUES (?, ?, 'reviewed', ?, ?)")
-        .run(report.id, req.user.id, comment, now);
+      await t.query("update reports set reviewed_by = $1, reviewed_at = now(), review_comment = $2 where id = $3 and status = 'submitted'",
+        [req.user.id, comment, report.id]);
+      await log('reviewed');
       flash(req, 'success', '已標記為「查閱完成」。');
     } else if (action === 'unreview') {
-      db.prepare("UPDATE reports SET reviewed_by = NULL, reviewed_at = NULL, review_comment = '' WHERE id = ?").run(report.id);
-      db.prepare("INSERT INTO review_logs (report_id, user_id, action, comment, created_at) VALUES (?, ?, 'unreviewed', ?, ?)")
-        .run(report.id, req.user.id, comment, now);
+      await t.query("update reports set reviewed_by = null, reviewed_at = null, review_comment = '' where id = $1", [report.id]);
+      await log('unreviewed');
       flash(req, 'success', '已撤回查閱狀態，業務人員可再次修改。');
     } else if (action === 'comment' && comment) {
-      db.prepare('UPDATE reports SET review_comment = ? WHERE id = ?').run(comment, report.id);
-      db.prepare("INSERT INTO review_logs (report_id, user_id, action, comment, created_at) VALUES (?, ?, 'commented', ?, ?)")
-        .run(report.id, req.user.id, comment, now);
+      await t.query('update reports set review_comment = $1 where id = $2', [comment, report.id]);
+      await log('commented');
       flash(req, 'success', '主管意見已更新。');
     }
   });

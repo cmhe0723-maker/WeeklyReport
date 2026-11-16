@@ -1,93 +1,96 @@
 'use strict';
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { db, transaction } = require('../db');
+const db = require('../db');
 const { requireRole, flash } = require('../auth');
 
 const router = express.Router();
 const admin = requireRole('admin');
 const ROLES = ['admin', 'manager', 'staff'];
 
+function idParam(v) {
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
 /* ---------- 部門 ---------- */
-router.get('/admin/departments', admin, (req, res) => {
-  const departments = db.prepare(
-    `SELECT d.id, d.name,
-       (SELECT COUNT(*) FROM users u WHERE u.department_id = d.id) AS member_count,
-       (SELECT GROUP_CONCAT(u.name, '、') FROM manager_departments md JOIN users u ON u.id = md.user_id
-          WHERE md.department_id = d.id AND u.active = 1) AS managers
-     FROM departments d ORDER BY d.name`
-  ).all();
+router.get('/admin/departments', admin, async (req, res) => {
+  const departments = await db.query(
+    `select d.id, d.name,
+       (select count(*) from users u where u.department_id = d.id) as member_count,
+       (select string_agg(u.name, '、' order by u.name) from manager_departments md join users u on u.id = md.user_id
+          where md.department_id = d.id and u.active) as managers
+     from departments d order by d.name`
+  );
   res.render('admin/departments', { title: '部門管理', departments });
 });
 
-router.post('/admin/departments', admin, (req, res) => {
+router.post('/admin/departments', admin, async (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 50);
   if (!name) flash(req, 'error', '請輸入部門名稱。');
-  else if (db.prepare('SELECT 1 FROM departments WHERE name = ?').get(name)) flash(req, 'error', '部門名稱已存在。');
   else {
-    db.prepare('INSERT INTO departments (name) VALUES (?)').run(name);
-    flash(req, 'success', `已新增部門「${name}」。`);
+    const row = await db.one('insert into departments (name) values ($1) on conflict (name) do nothing returning id', [name]);
+    if (row) flash(req, 'success', `已新增部門「${name}」。`);
+    else flash(req, 'error', '部門名稱已存在。');
   }
   res.redirect('/admin/departments');
 });
 
-router.post('/admin/departments/:id', admin, (req, res) => {
-  const id = Number(req.params.id);
+router.post('/admin/departments/:id', admin, async (req, res) => {
+  const id = idParam(req.params.id);
   const name = String(req.body.name || '').trim().slice(0, 50);
   if (!name) flash(req, 'error', '部門名稱不可空白。');
-  else if (db.prepare('SELECT 1 FROM departments WHERE name = ? AND id <> ?').get(name, id)) flash(req, 'error', '部門名稱已存在。');
+  else if (await db.one('select 1 from departments where name = $1 and id <> $2', [name, id])) flash(req, 'error', '部門名稱已存在。');
   else {
-    db.prepare('UPDATE departments SET name = ? WHERE id = ?').run(name, id);
+    await db.query('update departments set name = $1 where id = $2', [name, id]);
     flash(req, 'success', '部門名稱已更新。');
   }
   res.redirect('/admin/departments');
 });
 
-router.post('/admin/departments/:id/delete', admin, (req, res) => {
-  const id = Number(req.params.id);
-  const members = db.prepare('SELECT COUNT(*) AS c FROM users WHERE department_id = ?').get(id).c;
-  if (members > 0) flash(req, 'error', '此部門仍有人員，請先將人員移至其他部門。');
-  else {
-    db.prepare('DELETE FROM departments WHERE id = ?').run(id);
-    flash(req, 'success', '部門已刪除。');
-  }
+router.post('/admin/departments/:id/delete', admin, async (req, res) => {
+  const id = idParam(req.params.id);
+  const deleted = await db.one(
+    'delete from departments where id = $1 and not exists (select 1 from users where department_id = $1) returning id',
+    [id]
+  );
+  if (deleted) flash(req, 'success', '部門已刪除。');
+  else flash(req, 'error', '此部門仍有人員，請先將人員移至其他部門。');
   res.redirect('/admin/departments');
 });
 
 /* ---------- 人員 ---------- */
-router.get('/admin/users', admin, (req, res) => {
-  const dept = Number(req.query.dept) || 0;
-  const users = db.prepare(
-    `SELECT u.id, u.username, u.name, u.role, u.active, u.department_id, d.name AS department_name,
-       (SELECT GROUP_CONCAT(d2.name, '、') FROM manager_departments md JOIN departments d2 ON d2.id = md.department_id
-          WHERE md.user_id = u.id) AS managed
-     FROM users u LEFT JOIN departments d ON d.id = u.department_id
-     ${dept ? 'WHERE u.department_id = ?' : ''}
-     ORDER BY u.active DESC, d.name, CASE u.role WHEN 'admin' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END, u.name`
-  ).all(...(dept ? [dept] : []));
-  const departments = db.prepare('SELECT id, name FROM departments ORDER BY name').all();
+router.get('/admin/users', admin, async (req, res) => {
+  const dept = idParam(req.query.dept);
+  const users = await db.query(
+    `select u.id, u.username, u.name, u.role, u.active, u.department_id, d.name as department_name,
+       (select string_agg(d2.name, '、' order by d2.name) from manager_departments md join departments d2 on d2.id = md.department_id
+          where md.user_id = u.id) as managed
+     from users u left join departments d on d.id = u.department_id
+     where ($1::bigint = 0 or u.department_id = $1)
+     order by u.active desc, d.name, case u.role when 'admin' then 0 when 'manager' then 1 else 2 end, u.name`,
+    [dept]
+  );
+  const departments = await db.query('select id, name from departments order by name');
   res.render('admin/users', { title: '人員與權限', users, departments, dept });
 });
 
-function formData(user) {
-  return {
-    user,
-    departments: db.prepare('SELECT id, name FROM departments ORDER BY name').all(),
-  };
+async function formData(user) {
+  return { user, departments: await db.query('select id, name from departments order by name') };
 }
 
-router.get('/admin/users/new', admin, (req, res) => {
+router.get('/admin/users/new', admin, async (req, res) => {
   res.render('admin/user-form', {
     title: '新增人員', error: null,
-    ...formData({ id: null, username: '', name: '', role: 'staff', department_id: null, active: 1, managed: [] }),
+    ...(await formData({ id: null, username: '', name: '', role: 'staff', department_id: null, active: true, managed: [] })),
   });
 });
 
-router.get('/admin/users/:id', admin, (req, res) => {
-  const user = db.prepare('SELECT id, username, name, role, department_id, active FROM users WHERE id = ?').get(Number(req.params.id));
+router.get('/admin/users/:id', admin, async (req, res) => {
+  const user = await db.one('select id, username, name, role, department_id, active from users where id = $1', [idParam(req.params.id)]);
   if (!user) return res.status(404).render('error', { title: '找不到人員', message: '人員不存在。' });
-  user.managed = db.prepare('SELECT department_id FROM manager_departments WHERE user_id = ?').all(user.id).map(r => r.department_id);
-  res.render('admin/user-form', { title: '編輯人員', error: null, ...formData(user) });
+  user.managed = (await db.query('select department_id from manager_departments where user_id = $1', [user.id])).map((r) => r.department_id);
+  res.render('admin/user-form', { title: '編輯人員', error: null, ...(await formData(user)) });
 });
 
 function parseUserBody(body) {
@@ -97,70 +100,73 @@ function parseUserBody(body) {
     username: String(body.username || '').trim().slice(0, 50),
     name: String(body.name || '').trim().slice(0, 50),
     role: ROLES.includes(body.role) ? body.role : 'staff',
-    department_id: Number(body.department_id) || null,
-    active: body.active ? 1 : 0,
-    managed: [...new Set(managed.map(Number).filter(Boolean))],
+    department_id: idParam(body.department_id) || null,
+    active: Boolean(body.active),
+    managed: [...new Set(managed.map(idParam).filter(Boolean))],
     password: String(body.password || ''),
   };
 }
 
-function validate(data, isNew, editingId) {
+async function validate(data, isNew, editingId) {
   if (!/^[A-Za-z0-9._-]{3,50}$/.test(data.username)) return '帳號需為 3–50 個英數字或 . _ - 符號。';
   if (!data.name) return '請輸入姓名。';
   if (data.role !== 'admin' && !data.department_id) return '請選擇所屬部門。';
   if (isNew && data.password.length < 8) return '初始密碼至少需 8 個字元。';
   if (!isNew && data.password && data.password.length < 8) return '重設密碼至少需 8 個字元。';
   if (data.role === 'manager' && data.managed.length === 0) return '主管至少需設定一個可查閱的部門。';
-  const dup = db.prepare('SELECT id FROM users WHERE username = ?').get(data.username);
+  const dup = await db.one('select id from users where lower(username) = lower($1)', [data.username]);
   if (dup && dup.id !== editingId) return '此帳號已被使用。';
   return null;
 }
 
-function saveManaged(userId, role, managed) {
-  db.prepare('DELETE FROM manager_departments WHERE user_id = ?').run(userId);
-  if (role !== 'manager') return;
-  const ins = db.prepare('INSERT OR IGNORE INTO manager_departments (user_id, department_id) SELECT ?, id FROM departments WHERE id = ?');
-  for (const d of managed) ins.run(userId, d);
+async function saveManaged(t, userId, role, managed) {
+  await t.query('delete from manager_departments where user_id = $1', [userId]);
+  if (role !== 'manager' || !managed.length) return;
+  await t.query(
+    `insert into manager_departments (user_id, department_id)
+     select $1, id from departments where id = any($2::bigint[]) on conflict do nothing`,
+    [userId, managed]
+  );
 }
 
-router.post('/admin/users', admin, (req, res) => {
+router.post('/admin/users', admin, async (req, res) => {
   const data = parseUserBody(req.body);
-  const error = validate(data, true, null);
+  const error = await validate(data, true, null);
   if (error) {
-    return res.status(400).render('admin/user-form', { title: '新增人員', error, ...formData({ id: null, ...data }) });
+    return res.status(400).render('admin/user-form', { title: '新增人員', error, ...(await formData({ id: null, ...data })) });
   }
-  transaction(() => {
-    const info = db.prepare(
-      `INSERT INTO users (username, password_hash, name, role, department_id, active, must_change_password)
-       VALUES (?, ?, ?, ?, ?, ?, 1)`
-    ).run(data.username, bcrypt.hashSync(data.password, 10), data.name, data.role, data.department_id, data.active);
-    saveManaged(Number(info.lastInsertRowid), data.role, data.managed);
+  const hash = await bcrypt.hash(data.password, 10);
+  await db.tx(async (t) => {
+    const row = await t.one(
+      `insert into users (username, password_hash, name, role, department_id, active, must_change_password)
+       values ($1, $2, $3, $4, $5, $6, true) returning id`,
+      [data.username, hash, data.name, data.role, data.department_id, data.active]
+    );
+    await saveManaged(t, row.id, data.role, data.managed);
   });
   flash(req, 'success', `已新增人員「${data.name}」，首次登入需變更密碼。`);
   res.redirect('/admin/users');
 });
 
-router.post('/admin/users/:id', admin, (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT id FROM users WHERE id = ?').get(id);
+router.post('/admin/users/:id', admin, async (req, res) => {
+  const id = idParam(req.params.id);
+  const existing = await db.one('select id from users where id = $1', [id]);
   if (!existing) return res.status(404).render('error', { title: '找不到人員', message: '人員不存在。' });
   const data = parseUserBody(req.body);
-  let error = validate(data, false, id);
+  let error = await validate(data, false, id);
   if (!error && id === req.user.id && (data.role !== 'admin' || !data.active)) {
     error = '不可停用自己的帳號或移除自己的管理員權限。';
   }
   if (error) {
-    return res.status(400).render('admin/user-form', { title: '編輯人員', error, ...formData({ id, ...data }) });
+    return res.status(400).render('admin/user-form', { title: '編輯人員', error, ...(await formData({ id, ...data })) });
   }
-  transaction(() => {
-    db.prepare('UPDATE users SET username = ?, name = ?, role = ?, department_id = ?, active = ? WHERE id = ?')
-      .run(data.username, data.name, data.role, data.department_id, data.active, id);
-    if (data.password) {
-      db.prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?')
-        .run(bcrypt.hashSync(data.password, 10), id);
-    }
-    saveManaged(id, data.role, data.managed);
-    if (!data.active) db.prepare("DELETE FROM sessions WHERE json_extract(data, '$.userId') = ?").run(id);
+  const hash = data.password ? await bcrypt.hash(data.password, 10) : null;
+  await db.tx(async (t) => {
+    await t.query('update users set username = $1, name = $2, role = $3, department_id = $4, active = $5 where id = $6',
+      [data.username, data.name, data.role, data.department_id, data.active, id]);
+    if (hash) await t.query('update users set password_hash = $1, must_change_password = true where id = $2', [hash, id]);
+    await saveManaged(t, id, data.role, data.managed);
+    if (!data.active) await t.query("delete from sessions where (data ->> 'userId')::bigint = $1", [id]);
   });
   flash(req, 'success', `已更新人員「${data.name}」。`);
   res.redirect('/admin/users');

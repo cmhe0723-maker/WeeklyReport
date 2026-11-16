@@ -1,104 +1,135 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
+const pg = require('pg');
 const bcrypt = require('bcryptjs');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'weekly-report.db');
-if (DB_PATH !== ':memory:') fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+// bigint (int8) → Number：本系統的 id 與 COUNT 都在安全整數範圍內
+pg.types.setTypeParser(20, (v) => Number(v));
+// date → 'YYYY-MM-DD' 字串（避免被轉成本地時區的 Date）
+pg.types.setTypeParser(1082, (v) => v);
 
-const db = new DatabaseSync(DB_PATH);
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+const SCHEMA_FILE = path.join(__dirname, '..', 'supabase', 'schema.sql');
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS departments (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT NOT NULL UNIQUE,
-  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
-CREATE TABLE IF NOT EXISTS users (
-  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-  username             TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  password_hash        TEXT NOT NULL,
-  name                 TEXT NOT NULL,
-  role                 TEXT NOT NULL CHECK (role IN ('admin','manager','staff')),
-  department_id        INTEGER REFERENCES departments(id) ON DELETE SET NULL,
-  active               INTEGER NOT NULL DEFAULT 1,
-  must_change_password INTEGER NOT NULL DEFAULT 0,
-  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
--- 主管可管理（查閱）的部門，一位主管可管理多個部門
-CREATE TABLE IF NOT EXISTS manager_departments (
-  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  department_id INTEGER NOT NULL REFERENCES departments(id) ON DELETE CASCADE,
-  PRIMARY KEY (user_id, department_id)
-);
-
-CREATE TABLE IF NOT EXISTS reports (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  week_start      TEXT NOT NULL,              -- 該週週一 YYYY-MM-DD
-  work_summary    TEXT NOT NULL DEFAULT '',   -- 本週工作內容
-  customer_visits TEXT NOT NULL DEFAULT '',   -- 客戶拜訪紀錄
-  sales_progress  TEXT NOT NULL DEFAULT '',   -- 業績 / 案件進度
-  next_week_plan  TEXT NOT NULL DEFAULT '',   -- 下週工作計畫
-  issues          TEXT NOT NULL DEFAULT '',   -- 問題與需協助事項
-  status          TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','submitted')),
-  submitted_at    TEXT,
-  reviewed_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  reviewed_at     TEXT,
-  review_comment  TEXT NOT NULL DEFAULT '',
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (user_id, week_start)
-);
-CREATE INDEX IF NOT EXISTS idx_reports_week ON reports(week_start);
-
--- 查閱歷程（標記查閱、撤回查閱）
-CREATE TABLE IF NOT EXISTS review_logs (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  report_id  INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-  user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  action     TEXT NOT NULL CHECK (action IN ('reviewed','unreviewed','commented')),
-  comment    TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-  sid     TEXT PRIMARY KEY,
-  data    TEXT NOT NULL,
-  expires INTEGER NOT NULL
-);
-`);
-
-function nowIso() {
-  return new Date().toISOString();
+/**
+ * 連線設定
+ *   DATABASE_URL      Supabase 連線字串（Dashboard → Connect）
+ *   DATABASE_SSL      off | require | verify（預設：本機為 off，其他為 require）
+ *   DATABASE_CA_CERT  DATABASE_SSL=verify 時使用的 CA 憑證檔路徑（Supabase 可下載）
+ */
+function poolConfig() {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) {
+    throw new Error('未設定 DATABASE_URL。請在 Supabase Dashboard → Connect 取得連線字串並設定此環境變數。');
+  }
+  const url = new URL(raw);
+  // 由下方 ssl 選項統一控制，避免連線字串中的 sslmode 覆蓋設定
+  url.searchParams.delete('sslmode');
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+  const mode = process.env.DATABASE_SSL || (isLocal ? 'off' : 'require');
+  let ssl = false;
+  if (mode === 'require') ssl = { rejectUnauthorized: false };
+  else if (mode === 'verify') {
+    ssl = { rejectUnauthorized: true };
+    if (process.env.DATABASE_CA_CERT) ssl.ca = fs.readFileSync(process.env.DATABASE_CA_CERT, 'utf8');
+  } else if (mode !== 'off') {
+    throw new Error(`DATABASE_SSL 只能是 off、require 或 verify，目前為「${mode}」。`);
+  }
+  return {
+    connectionString: url.toString(),
+    ssl,
+    max: Number(process.env.DB_POOL_MAX) || 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  };
 }
 
-// 第一次啟動時建立預設系統管理員
-function ensureAdmin() {
-  const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
-  if (count > 0) return;
-  const password = process.env.ADMIN_PASSWORD || 'admin1234';
-  db.prepare(
-    `INSERT INTO users (username, password_hash, name, role, must_change_password)
-     VALUES (?, ?, ?, 'admin', 1)`
-  ).run(process.env.ADMIN_USERNAME || 'admin', bcrypt.hashSync(password, 10), '系統管理員');
-  console.log(`[init] 已建立預設管理員帳號：${process.env.ADMIN_USERNAME || 'admin'}（首次登入需變更密碼）`);
+let pool = null;
+function getPool() {
+  if (!pool) {
+    pool = new pg.Pool(poolConfig());
+    pool.on('error', (err) => console.error('[db] 閒置連線發生錯誤：', err.message));
+  }
+  return pool;
 }
 
-function transaction(fn) {
-  db.exec('BEGIN');
+// 查詢多筆
+async function query(text, params) {
+  return (await getPool().query(text, params)).rows;
+}
+// 查詢單筆（沒有則回傳 null）
+async function one(text, params) {
+  return (await getPool().query(text, params)).rows[0] || null;
+}
+
+// 交易：fn 收到 { query, one }，丟出例外即 rollback
+async function tx(fn) {
+  const client = await getPool().connect();
+  const q = {
+    query: async (t, p) => (await client.query(t, p)).rows,
+    one: async (t, p) => (await client.query(t, p)).rows[0] || null,
+  };
   try {
-    const r = fn();
-    db.exec('COMMIT');
-    return r;
+    await client.query('begin');
+    const result = await fn(q);
+    await client.query('commit');
+    return result;
   } catch (e) {
-    db.exec('ROLLBACK');
+    await client.query('rollback').catch(() => {});
     throw e;
+  } finally {
+    client.release();
   }
 }
 
-module.exports = { db, ensureAdmin, nowIso, transaction };
+// 執行 supabase/schema.sql 建立資料表（可重複執行）
+async function migrate() {
+  const sql = fs.readFileSync(SCHEMA_FILE, 'utf8');
+  const client = await getPool().connect();
+  try {
+    await client.query(sql);
+  } finally {
+    client.release();
+  }
+}
+
+async function ensureSchema() {
+  const row = await one("select to_regclass('public.users') is not null as ok");
+  if (row.ok) return;
+  if (process.env.DB_AUTO_MIGRATE === '1') {
+    console.log('[init] 找不到資料表，執行 supabase/schema.sql 建立中…');
+    await migrate();
+    return;
+  }
+  throw new Error('資料庫尚未建立資料表。請先執行 `npm run db:migrate`，或在 Supabase SQL Editor 執行 supabase/schema.sql。');
+}
+
+// 第一次啟動時建立預設系統管理員
+async function ensureAdmin() {
+  const { c } = await one('select count(*) as c from users');
+  if (c > 0) return;
+  const username = process.env.ADMIN_USERNAME || 'admin';
+  const password = process.env.ADMIN_PASSWORD || 'admin1234';
+  await query(
+    `insert into users (username, password_hash, name, role, must_change_password)
+     values ($1, $2, '系統管理員', 'admin', true)
+     on conflict do nothing`,
+    [username, bcrypt.hashSync(password, 10)]
+  );
+  console.log(`[init] 已建立預設管理員帳號：${username}（首次登入需變更密碼）`);
+}
+
+async function init() {
+  await ensureSchema();
+  await ensureAdmin();
+}
+
+async function close() {
+  if (pool) {
+    const p = pool;
+    pool = null;
+    await p.end();
+  }
+}
+
+module.exports = { query, one, tx, migrate, init, ensureAdmin, close, getPool };

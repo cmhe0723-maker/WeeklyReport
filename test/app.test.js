@@ -1,14 +1,36 @@
 'use strict';
-process.env.DB_PATH = ':memory:';
-process.env.ADMIN_PASSWORD = 'admin1234';
+// 整合測試需要一個「可以清空」的 PostgreSQL 資料庫，請勿指向正式的 Supabase 專案：
+//   TEST_DATABASE_URL=postgresql://postgres@localhost:5432/wr_test npm test
 const test = require('node:test');
 const assert = require('node:assert');
-const app = require('../src/app');
+
+const TEST_DB = process.env.TEST_DATABASE_URL;
+if (!TEST_DB) {
+  test('整合測試（未設定 TEST_DATABASE_URL，略過）', { skip: true }, () => {});
+  return;
+}
+process.env.DATABASE_URL = TEST_DB;
+process.env.ADMIN_PASSWORD = 'admin1234';
+delete process.env.SESSION_SECRET;
+
+const db = require('../src/db');
+const { createApp } = require('../src/app');
 const util = require('../src/util');
 
 let server, base;
-test.before(() => new Promise(r => { server = app.listen(0, () => { base = `http://127.0.0.1:${server.address().port}`; r(); }); }));
-test.after(() => server.close());
+test.before(async () => {
+  // 清空測試資料庫並重新建立資料表
+  await db.query('drop schema public cascade');
+  await db.query('create schema public');
+  await db.migrate();
+  await db.migrate(); // 確認 schema.sql 可重複執行
+  const app = await createApp();
+  await new Promise((r) => { server = app.listen(0, () => { base = `http://127.0.0.1:${server.address().port}`; r(); }); });
+});
+test.after(async () => {
+  await new Promise((r) => server.close(r));
+  await db.close();
+});
 
 // 簡易瀏覽器：保留 cookie、自動帶 CSRF
 function client() {
@@ -149,4 +171,40 @@ test('完整流程：管理員設定 → 業務填寫 → 主管查閱', async (
   assert.match(r.location, /^\/login/);
   r = await amy.login('amy', 'amy123456');
   assert.strictEqual(r.status, 401);
+});
+
+test('帳號不分大小寫、部門刪除保護、Supabase 前端角色無權限', async () => {
+  const admin = client();
+  await admin.login('ADMIN', 'newpass123'); // 大寫也能登入
+  let r = await admin.get('/admin/users');
+  assert.strictEqual(r.status, 200);
+
+  // 帳號重複（大小寫不同）
+  await admin.get('/admin/users/new');
+  r = await admin.post('/admin/users', { username: 'BOSS', name: '重複', role: 'staff', department_id: '1', password: 'pass12345', active: '1' });
+  assert.strictEqual(r.status, 400);
+  assert.match(r.body, /此帳號已被使用/);
+
+  // 有人員的部門不可刪除
+  await admin.get('/admin/departments');
+  await admin.post('/admin/departments/1/delete', {});
+  r = await admin.get('/admin/departments');
+  assert.match(r.body, /北區業務部/);
+  assert.match(r.body, /仍有人員/);
+
+  // 空部門可刪除
+  await admin.post('/admin/departments', { name: '臨時部門' });
+  const id = (await db.one("select id from departments where name = '臨時部門'")).id;
+  await admin.post(`/admin/departments/${id}/delete`, {});
+  assert.strictEqual(await db.one("select id from departments where name = '臨時部門'"), null);
+
+  // week_start 必須是週一（資料庫層級保護）
+  await assert.rejects(db.query("insert into reports (user_id, week_start) values (1, '2026-11-17')"), /check constraint/);
+
+  // 若存在 Supabase 的 anon 角色，必須讀不到任何資料表
+  const anon = await db.one("select 1 as x from pg_roles where rolname = 'anon'");
+  if (anon) {
+    const priv = await db.one("select has_table_privilege('anon', 'public.users', 'select') as can");
+    assert.strictEqual(priv.can, false);
+  }
 });

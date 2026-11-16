@@ -1,42 +1,39 @@
 'use strict';
 const session = require('express-session');
 
-// 以 SQLite 儲存 session，伺服器重啟後使用者不需重新登入
-class SqliteStore extends session.Store {
+// 以資料庫 sessions 資料表儲存登入狀態，伺服器重啟或多台主機都能共用
+class PgStore extends session.Store {
   constructor(db, ttlMs) {
     super();
     this.db = db;
     this.ttlMs = ttlMs;
-    this.getStmt = db.prepare('SELECT data, expires FROM sessions WHERE sid = ?');
-    this.setStmt = db.prepare(
-      `INSERT INTO sessions (sid, data, expires) VALUES (?, ?, ?)
-       ON CONFLICT(sid) DO UPDATE SET data = excluded.data, expires = excluded.expires`
-    );
-    this.delStmt = db.prepare('DELETE FROM sessions WHERE sid = ?');
-    this.touchStmt = db.prepare('UPDATE sessions SET expires = ? WHERE sid = ?');
-    this.cleanupStmt = db.prepare('DELETE FROM sessions WHERE expires < ?');
-    setInterval(() => this.cleanupStmt.run(Date.now()), 60 * 60 * 1000).unref();
+    const timer = setInterval(() => {
+      this.db.query('delete from sessions where expires < now()').catch((e) => console.error('[session] 清除過期 session 失敗：', e.message));
+    }, 60 * 60 * 1000);
+    timer.unref();
   }
   expiry(sess) {
     const exp = sess && sess.cookie && sess.cookie.expires;
-    return exp ? new Date(exp).getTime() : Date.now() + this.ttlMs;
+    return exp ? new Date(exp) : new Date(Date.now() + this.ttlMs);
   }
   get(sid, cb) {
-    try {
-      const row = this.getStmt.get(sid);
-      if (!row || row.expires < Date.now()) return cb(null, null);
-      cb(null, JSON.parse(row.data));
-    } catch (e) { cb(e); }
+    this.db.one('select data from sessions where sid = $1 and expires > now()', [sid])
+      .then((row) => cb(null, row ? row.data : null), cb);
   }
   set(sid, sess, cb) {
-    try { this.setStmt.run(sid, JSON.stringify(sess), this.expiry(sess)); cb && cb(null); } catch (e) { cb && cb(e); }
+    this.db.query(
+      `insert into sessions (sid, data, expires) values ($1, $2, $3)
+       on conflict (sid) do update set data = excluded.data, expires = excluded.expires`,
+      [sid, JSON.stringify(sess), this.expiry(sess)]
+    ).then(() => cb && cb(null), (e) => cb && cb(e));
   }
   destroy(sid, cb) {
-    try { this.delStmt.run(sid); cb && cb(null); } catch (e) { cb && cb(e); }
+    this.db.query('delete from sessions where sid = $1', [sid]).then(() => cb && cb(null), (e) => cb && cb(e));
   }
   touch(sid, sess, cb) {
-    try { this.touchStmt.run(this.expiry(sess), sid); cb && cb(null); } catch (e) { cb && cb(e); }
+    this.db.query('update sessions set expires = $1 where sid = $2', [this.expiry(sess), sid])
+      .then(() => cb && cb(null), (e) => cb && cb(e));
   }
 }
 
-module.exports = SqliteStore;
+module.exports = PgStore;

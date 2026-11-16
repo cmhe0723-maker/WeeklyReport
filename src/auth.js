@@ -1,5 +1,5 @@
 'use strict';
-const { db } = require('./db');
+const db = require('./db');
 
 function requireLogin(req, res, next) {
   if (!req.user) return res.redirect('/login?next=' + encodeURIComponent(req.originalUrl));
@@ -17,28 +17,24 @@ function requireRole(...roles) {
 }
 
 // 使用者可查閱的部門 id 清單；admin 回傳 null 代表全部
-function managedDeptIds(user) {
+async function managedDeptIds(user) {
   if (user.role === 'admin') return null;
   if (user.role !== 'manager') return [];
-  return db.prepare('SELECT department_id FROM manager_departments WHERE user_id = ?')
-    .all(user.id).map(r => r.department_id);
-}
-
-function canSeeDept(user, deptId) {
-  const ids = managedDeptIds(user);
-  return ids === null || ids.includes(deptId);
+  const rows = await db.query('select department_id from manager_departments where user_id = $1', [user.id]);
+  return rows.map((r) => r.department_id);
 }
 
 // 可查看他人週報：admin，或負責該員所屬部門的主管；且週報需已提交
-function canReview(user, report) {
+async function canReview(user, report) {
   if (report.user_id === user.id) return false;
   if (report.status !== 'submitted') return false;
   if (user.role === 'admin') return true;
-  if (user.role !== 'manager') return false;
-  return report.author_department_id != null && canSeeDept(user, report.author_department_id);
+  if (user.role !== 'manager' || report.author_department_id == null) return false;
+  const ids = await managedDeptIds(user);
+  return ids.includes(report.author_department_id);
 }
 
-function canView(user, report) {
+async function canView(user, report) {
   return report.user_id === user.id || canReview(user, report);
 }
 
@@ -46,4 +42,4 @@ function flash(req, type, text) {
   req.session.flash = { type, text };
 }
 
-module.exports = { requireLogin, requireRole, managedDeptIds, canSeeDept, canReview, canView, flash };
+module.exports = { requireLogin, requireRole, managedDeptIds, canReview, canView, flash };
