@@ -1,4 +1,4 @@
-/* 業務週報系統 — 前端（GitHub Pages 靜態網站 + Supabase）
+/* 工作週報系統 — 前端（GitHub Pages 靜態網站 + Supabase）
  * 讀取資料受 Supabase RLS 限制；所有寫入都呼叫 supabase/schema.sql 中的 RPC 函式，
  * 權限由資料庫端檢查，前端的權限判斷只用來決定要顯示哪些按鈕。
  */
@@ -137,7 +137,7 @@
     const dept = me.department ? '・' + esc(me.department.name) : '';
     root.innerHTML = `
       <header class="topbar"><div class="topbar-inner">
-        <a class="brand" href="#/">業務週報系統</a>
+        <a class="brand" href="#/">工作週報系統</a>
         <nav class="nav">
           ${isWriter() ? navLink('/reports', '我的週報', section === 'reports') : ''}
           ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') : ''}
@@ -197,7 +197,7 @@
   function renderLogin(error, username, next) {
     root.innerHTML = `
       <main class="container"><section class="login">
-        <h1>業務週報系統</h1>
+        <h1>工作週報系統</h1>
         <p class="muted">請使用您的帳號登入</p>
         <form class="stack" data-login>
           <div data-error>${error ? `<div class="alert alert-error">${esc(error)}</div>` : ''}</div>
