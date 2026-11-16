@@ -1,13 +1,9 @@
 {
   "name": "weekly-report",
   "version": "1.0.0",
-  "description": "業務人員每週工作會報週報表記錄系統",
-  "main": "src/server.js",
+  "description": "業務人員每週工作會報週報表記錄系統（GitHub Pages + Supabase）",
   "scripts": {
-    "start": "node --env-file-if-exists=.env src/server.js",
-    "dev": "node --env-file-if-exists=.env --watch src/server.js",
-    "db:migrate": "node --env-file-if-exists=.env scripts/migrate.js",
-    "seed:demo": "node --env-file-if-exists=.env scripts/seed-demo.js",
+    "serve": "node scripts/serve.js",
     "test": "node --test --test-concurrency=1 test/*.test.js"
   },
   "repository": {
@@ -18,15 +14,11 @@
     "url": "https://github.com/cmhe0723-maker/WeeklyReport/issues"
   },
   "homepage": "https://github.com/cmhe0723-maker/WeeklyReport#readme",
-  "dependencies": {
-    "bcryptjs": "^3.0.3",
-    "ejs": "^7.0.2",
-    "express": "^5.3.0",
-    "express-session": "^1.19.0",
-    "pg": "^8.23.1"
-  },
   "private": true,
   "engines": {
-    "node": ">=22.9"
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "pg": "^8.23.1"
   }
 }
