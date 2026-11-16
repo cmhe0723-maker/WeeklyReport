@@ -96,13 +96,19 @@ create table if not exists public.reports (
 );
 comment on table  public.reports                 is '業務週報';
 comment on column public.reports.week_start      is '該週週一';
-comment on column public.reports.work_summary    is '本週工作內容';
+comment on column public.reports.work_summary    is '本週工作內容（舊版欄位；新版改以 daily_work 逐日記錄）';
 comment on column public.reports.customer_visits is '客戶拜訪紀錄';
 comment on column public.reports.sales_progress  is '業績與案件進度';
 comment on column public.reports.next_week_plan  is '下週工作計畫';
 comment on column public.reports.issues          is '問題與需協助事項';
 comment on column public.reports.reviewed_at     is '主管標記查閱完成的時間；null 代表尚未查閱';
 comment on column public.reports.reviewer_name   is '查閱主管姓名（快照，讓業務人員不需讀取主管資料也能顯示）';
+-- 每日工作內容：7 個字串的陣列，依序為週一～週日（新增欄位，舊資料預設為空陣列）
+alter table public.reports
+  add column if not exists daily_work jsonb not null default '[]'::jsonb
+  constraint reports_daily_work_chk
+    check (jsonb_typeof(daily_work) = 'array' and jsonb_array_length(daily_work) <= 7);
+comment on column public.reports.daily_work      is '每日工作內容，陣列依序為週一～週日';
 create index if not exists reports_week_start_idx  on public.reports (week_start);
 create index if not exists reports_reviewed_by_idx on public.reports (reviewed_by);
 create index if not exists reports_pending_idx     on public.reports (week_start)
@@ -132,7 +138,7 @@ end;
 $$;
 drop trigger if exists reports_set_updated_at on public.reports;
 create trigger reports_set_updated_at
-  before update of work_summary, customer_visits, sales_progress, next_week_plan, issues, status
+  before update of work_summary, daily_work, customer_visits, sales_progress, next_week_plan, issues, status
   on public.reports
   for each row execute function private.set_updated_at();
 
@@ -253,10 +259,14 @@ grant select on public.departments, public.profiles, public.manager_departments,
 -- =============================================================================
 
 -- 新增或修改自己的週報。p_id 為 null 表示新增；p_submit = true 表示提交給主管
+-- p_daily_work：每日工作內容，依序為週一～週日（最多 7 筆，每筆最多 4000 字）
+-- p_work_summary：舊版「本週工作內容」欄位，新週報傳空字串即可
+drop function if exists public.save_report(bigint, date, text, text, text, text, text, boolean);
 create or replace function public.save_report(
   p_id              bigint,
   p_week            date,
   p_work_summary    text,
+  p_daily_work      text[],
   p_customer_visits text,
   p_sales_progress  text,
   p_next_week_plan  text,
@@ -269,6 +279,7 @@ declare
   v_role text := private.my_role();
   v_old  public.reports;
   v_id   bigint;
+  v_days text[];
 begin
   if v_role is null or v_role not in ('staff', 'manager') then
     raise exception '沒有權限填寫週報。';
@@ -279,17 +290,28 @@ begin
   p_next_week_plan  := btrim(coalesce(p_next_week_plan, ''));
   p_issues          := btrim(coalesce(p_issues, ''));
   p_submit          := coalesce(p_submit, false);
-  if p_submit and p_work_summary = '' then
-    raise exception '提交前請填寫「本週工作內容」。';
+  if coalesce(cardinality(p_daily_work), 0) > 7 then
+    raise exception '每日工作內容最多 7 天。';
+  end if;
+  v_days := array(
+    select left(btrim(coalesce(d, '')), 4000)
+    from unnest(coalesce(p_daily_work, '{}'::text[])) with ordinality as t(d, i)
+    order by i
+  );
+  while coalesce(cardinality(v_days), 0) < 7 loop
+    v_days := array_append(v_days, '');
+  end loop;
+  if p_submit and p_work_summary = '' and not exists (select 1 from unnest(v_days) d where d <> '') then
+    raise exception '提交前請至少填寫一天的工作內容。';
   end if;
 
   if p_id is null then
     if p_week is null then
       raise exception '請選擇正確的週次日期。';
     end if;
-    insert into public.reports (user_id, week_start, work_summary, customer_visits, sales_progress,
+    insert into public.reports (user_id, week_start, work_summary, daily_work, customer_visits, sales_progress,
                                 next_week_plan, issues, status, submitted_at)
-    values (v_uid, date_trunc('week', p_week)::date, p_work_summary, p_customer_visits, p_sales_progress,
+    values (v_uid, date_trunc('week', p_week)::date, p_work_summary, to_jsonb(v_days), p_customer_visits, p_sales_progress,
             p_next_week_plan, p_issues,
             case when p_submit then 'submitted' else 'draft' end,
             case when p_submit then now() end)
@@ -310,6 +332,7 @@ begin
   end if;
   update public.reports set
     work_summary    = p_work_summary,
+    daily_work      = to_jsonb(v_days),
     customer_visits = p_customer_visits,
     sales_progress  = p_sales_progress,
     next_week_plan  = p_next_week_plan,

@@ -47,7 +47,8 @@ const db = {
   manager_departments: [{ user_id: U.boss, department_id: 1 }],
   reports: [
     {
-      id: 1, user_id: U.amy, week_start: LAST_WEEK, work_summary: '拜訪大成科技<script>alert(1)</script>', customer_visits: '採購王課長',
+      id: 1, user_id: U.amy, week_start: LAST_WEEK, work_summary: '', customer_visits: '採購王課長',
+      daily_work: ['拜訪大成科技<script>alert(1)</script>', '', '完成長興報價', '', '', '週六展覽', ''],
       sales_progress: '報價 35 萬', next_week_plan: '追蹤簽約', issues: '', status: 'submitted',
       submitted_at: new Date().toISOString(), updated_at: new Date().toISOString(), reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '',
     },
@@ -112,11 +113,11 @@ function rpc(fn, args, uid) {
     case 'save_report': {
       if (args.p_id) {
         const r = db.reports.find((x) => x.id === args.p_id);
-        Object.assign(r, { work_summary: args.p_work_summary, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? (r.submitted_at || now) : null, updated_at: now });
+        Object.assign(r, { work_summary: args.p_work_summary, daily_work: args.p_daily_work, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? (r.submitted_at || now) : null, updated_at: now });
         return r.id;
       }
       const id = Math.max(...db.reports.map((x) => x.id)) + 1;
-      db.reports.push({ id, user_id: uid, week_start: args.p_week, work_summary: args.p_work_summary, customer_visits: args.p_customer_visits, sales_progress: args.p_sales_progress, next_week_plan: args.p_next_week_plan, issues: args.p_issues, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? now : null, updated_at: now, reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
+      db.reports.push({ id, user_id: uid, week_start: args.p_week, work_summary: args.p_work_summary, daily_work: args.p_daily_work, customer_visits: args.p_customer_visits, sales_progress: args.p_sales_progress, next_week_plan: args.p_next_week_plan, issues: args.p_issues, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? now : null, updated_at: now, reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
       return id;
     }
     case 'review_report': {
@@ -242,11 +243,13 @@ test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () =
 
   await page.goto(base + '#/review?week=all&status=pending');
   await page.waitForSelector('a.btn-sm[href^="#/reports/1"]');
+  assert.match(await page.textContent('td.summary'), /^一：拜訪大成科技/);
   await page.click('a.btn-sm[href^="#/reports/1"]');
   await page.waitForSelector('[data-review]');
   // XSS：週報內容必須以文字顯示
   assert.match(await page.textContent('.report-body'), /<script>alert\(1\)<\/script>/);
   assert.strictEqual(await page.$('.report-body script'), null);
+  assert.match(await page.textContent('.daily-view'), /週三[\s\S]*完成長興報價[\s\S]*週六[\s\S]*週六展覽/);
 
   await page.fill('textarea[name=comment]', '做得好');
   await page.click('button[value=review]');
@@ -267,17 +270,31 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   assert.strictEqual(await page.$('a[href="#/review"]'), null, '業務不應看到查閱選單');
 
   await page.click(`a[href="#/reports/new?week=${THIS_WEEK}"]`);
-  await page.waitForSelector('textarea[name=work_summary]');
+  await page.waitForSelector('textarea[name=day0]');
+  // 週一～週五直接顯示、週末收合；欄位標示日期
+  assert.match(await page.textContent('[data-day-label="0"]'), new RegExp('週一 ' + THIS_WEEK.slice(5).replace('-', '/')));
+  assert.strictEqual(await page.isVisible('textarea[name=day4]'), true);
+  assert.strictEqual(await page.isVisible('textarea[name=day6]'), false);
+  assert.strictEqual(await page.$('textarea[name=work_summary]'), null, '新週報不顯示舊版欄位');
   assert.match(await page.textContent('.prev-plan'), /追蹤簽約/);
   await page.click('button[value=submit]');
   await page.waitForSelector('[data-error] .alert-error'); // 未填內容
-  await page.fill('textarea[name=work_summary]', '拜訪三家客戶');
+  await page.fill('textarea[name=day0]', '拜訪三家客戶');
+  await page.fill('textarea[name=day2]', '準備報價');
+  await page.click('details.weekend summary');
+  await page.fill('textarea[name=day6]', '週日拜訪');
+  await page.screenshot({ path: path.join(process.env.SHOT_DIR || '/tmp', 'ui-daily-form.png'), fullPage: true });
   await page.click('button[value=submit]');
   await page.waitForSelector('.report-body');
   const call = rpcCalls.at(-1);
   assert.strictEqual(call.fn, 'save_report');
-  assert.deepStrictEqual({ p_id: call.args.p_id, p_week: call.args.p_week, p_submit: call.args.p_submit, p_work_summary: call.args.p_work_summary },
-    { p_id: null, p_week: THIS_WEEK, p_submit: true, p_work_summary: '拜訪三家客戶' });
+  assert.deepStrictEqual({ p_id: call.args.p_id, p_week: call.args.p_week, p_submit: call.args.p_submit, p_work_summary: call.args.p_work_summary, p_daily_work: call.args.p_daily_work },
+    { p_id: null, p_week: THIS_WEEK, p_submit: true, p_work_summary: '', p_daily_work: ['拜訪三家客戶', '', '準備報價', '', '', '', '週日拜訪'] });
+  // 檢視頁：平日都列出、週末只列出有內容的那天
+  const view = await page.textContent('.daily-view');
+  assert.match(view, /週一[\s\S]*拜訪三家客戶[\s\S]*週二[\s\S]*未填寫[\s\S]*週三[\s\S]*準備報價/);
+  assert.match(view, /週日[\s\S]*週日拜訪/);
+  assert.doesNotMatch(view, /週六/);
   assert.match(await page.textContent('main'), /待查閱/);
 
   await page.goto(base + '#/admin/users');

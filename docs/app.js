@@ -12,8 +12,8 @@
   const root = document.getElementById('app');
   const TZ = cfg.timeZone || 'Asia/Taipei';
   const ROLE_LABELS = { admin: '系統管理員', manager: '主管', staff: '業務人員' };
+  // 每週欄位（「每日工作內容」另外處理）
   const FIELDS = [
-    ['work_summary', '本週工作內容'],
     ['customer_visits', '客戶拜訪紀錄'],
     ['sales_progress', '業績與案件進度'],
     ['next_week_plan', '下週工作計畫'],
@@ -72,6 +72,24 @@
     if (!r || !r.id) return 'missing';
     if (r.status === 'draft') return 'draft';
     return r.reviewed_at ? 'reviewed' : 'pending';
+  }
+  const DAY_NAMES = ['一', '二', '三', '四', '五', '六', '日'];
+  // 週報的每日工作內容 → 長度 7 的字串陣列（週一～週日）
+  function dailyOf(r) {
+    const a = r && Array.isArray(r.daily_work) ? r.daily_work : [];
+    return DAY_NAMES.map((_, i) => String(a[i] || ''));
+  }
+  function dayLabel(ws, i) {
+    return `週${DAY_NAMES[i]} ${addDays(ws, i).slice(5).replace('-', '/')}`;
+  }
+  function dayLabelHtml(ws, i) {
+    return esc(dayLabel(ws, i)) + (addDays(ws, i) === todayStr() ? ' <span class="tag tag-manager">今天</span>' : '');
+  }
+  // 列表用的內容摘要：「一：…；三：…」
+  function workPreview(r) {
+    const parts = dailyOf(r).map((t, i) => (t ? `${DAY_NAMES[i]}：${t.replace(/\s+/g, ' ')}` : '')).filter(Boolean);
+    if (r.work_summary) parts.push(r.work_summary.replace(/\s+/g, ' '));
+    return parts.join('；');
   }
   function badge(state) {
     const [t, c] = { missing: ['未提交', 'muted'], draft: ['草稿', 'muted'], pending: ['待查閱', 'warn'], reviewed: ['已查閱', 'ok'] }[state];
@@ -298,6 +316,9 @@
       .eq('user_id', me.id).lt('week_start', report.week_start).neq('next_week_plan', '')
       .order('week_start', { ascending: false }).limit(1).maybeSingle());
 
+    const days = dailyOf(report);
+    const dayField = (i) => `<label class="day-field"><span data-day-label="${i}">${dayLabelHtml(report.week_start, i)}</span>
+      <textarea name="day${i}" rows="3" maxlength="4000" placeholder="${i === 0 ? '例：拜訪 A 公司說明新方案；完成 B 案報價' : ''}">${esc(days[i])}</textarea></label>`;
     const ta = (name, rows, ph) => `<textarea name="${name}" rows="${rows}" maxlength="10000" placeholder="${esc(ph || '')}">${esc(report[name] || '')}</textarea>`;
     layout(`
       <div class="page-head">
@@ -314,7 +335,15 @@
           <div class="muted small" data-week-label>${weekLabel(report.week_start)}</div>
         </div>
         ${prev ? `<details class="prev-plan"><summary>參考：上次填寫的「下週工作計畫」（${weekLabel(prev.week_start)}）</summary><div class="pre">${esc(prev.next_week_plan)}</div></details>` : ''}
-        <label><span>本週工作內容 <span class="req">*</span></span>${ta('work_summary', 7, '例：\n1. 拜訪 A 公司，說明新方案\n2. 完成 B 案報價')}</label>
+        <fieldset class="daily">
+          <legend>每日工作內容 <span class="req">*</span> <span class="hint">至少填寫一天</span></legend>
+          ${[0, 1, 2, 3, 4].map(dayField).join('')}
+          <details class="weekend" ${days[5] || days[6] ? 'open' : ''}>
+            <summary>週六、週日（選填）</summary>
+            ${[5, 6].map(dayField).join('')}
+          </details>
+        </fieldset>
+        ${report.work_summary ? `<label>本週工作內容（舊版欄位）${ta('work_summary', 4)}</label>` : ''}
         <label>客戶拜訪紀錄${ta('customer_visits', 5, '客戶名稱／拜訪日期／洽談重點')}</label>
         <label>業績與案件進度${ta('sales_progress', 4, '成交金額、報價中案件、預計結案時間等')}</label>
         <label>下週工作計畫${ta('next_week_plan', 5)}</label>
@@ -332,16 +361,18 @@
     if (picker) picker.addEventListener('change', () => {
       const ws = weekStartOf(picker.value);
       form.querySelector('[data-week-label]').textContent = ws ? '本週報週次：' + weekLabel(ws) : '';
+      if (ws) form.querySelectorAll('[data-day-label]').forEach((el) => { el.innerHTML = dayLabelHtml(ws, Number(el.dataset.dayLabel)); });
     });
     onSubmit(form, async (fd, action) => {
       const text = (k) => String(fd.get(k) || '').replace(/\r\n/g, '\n').trim();
       const submit = action === 'submit';
-      if (submit && !text('work_summary')) throw new Error('提交前請填寫「本週工作內容」。');
+      const daily = DAY_NAMES.map((_, i) => text('day' + i));
+      if (submit && !daily.some(Boolean) && !text('work_summary')) throw new Error('提交前請至少填寫一天的工作內容。');
       const week = report.id ? null : weekStartOf(String(fd.get('week') || ''));
       if (!report.id && !week) throw new Error('請選擇正確的週次日期。');
       const newId = must(await sb.rpc('save_report', {
         p_id: report.id, p_week: week,
-        p_work_summary: text('work_summary'), p_customer_visits: text('customer_visits'),
+        p_work_summary: text('work_summary'), p_daily_work: daily, p_customer_visits: text('customer_visits'),
         p_sales_progress: text('sales_progress'), p_next_week_plan: text('next_week_plan'),
         p_issues: text('issues'), p_submit: submit,
       }));
@@ -379,6 +410,11 @@
       </div>
       <div class="grid-2">
         <section class="card report-body">
+          <h3>每日工作內容</h3>
+          <div class="daily-view">${dailyOf(report).map((t, i) => (i < 5 || t ? `<div class="day-row">
+            <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
+            <div class="pre ${t ? '' : 'muted'}">${esc(t || '（未填寫）')}</div></div>` : '')).join('')}</div>
+          ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
           ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}
           <p class="muted small meta">${report.submitted_at ? `提交：${fmtDateTime(report.submitted_at)}・` : ''}最後更新：${fmtDateTime(report.updated_at)}</p>
         </section>
@@ -447,7 +483,7 @@
       const people = must(await sb.from('profiles').select('id, name, role, department_id')
         .eq('active', true).in('role', ['staff', 'manager']).neq('id', me.id).in('department_id', scopeIds));
       const reports = must(await sb.from('reports')
-        .select('id, user_id, status, submitted_at, reviewed_at, reviewer_name, work_summary').eq('week_start', week));
+        .select('id, user_id, status, submitted_at, reviewed_at, reviewer_name, work_summary, daily_work').eq('week_start', week));
       const byUser = Object.fromEntries(reports.map((r) => [r.user_id, r]));
       rows = people.map((p) => {
         const r = byUser[p.id] || {};
@@ -464,7 +500,7 @@
       if (status !== 'all') rows = rows.filter((r) => r.state === status);
     } else if (scopeIds.length && status !== 'missing') {
       let q = sb.from('reports')
-        .select('id, user_id, week_start, status, reviewed_at, reviewer_name, work_summary, author:profiles!reports_user_id_fkey!inner(name, role, department_id)')
+        .select('id, user_id, week_start, status, reviewed_at, reviewer_name, work_summary, daily_work, author:profiles!reports_user_id_fkey!inner(name, role, department_id)')
         .eq('status', 'submitted').neq('user_id', me.id).in('author.department_id', scopeIds)
         .order('week_start', { ascending: false }).limit(500);
       if (status === 'pending') q = q.is('reviewed_at', null);
@@ -513,7 +549,7 @@
           </tr></thead>
           <tbody>${rows.map((r) => {
             const visible = r.state === 'pending' || r.state === 'reviewed';
-            const sum = r.work_summary || '';
+            const sum = workPreview(r);
             return `<tr class="state-${r.state}">
               <td class="check">${r.state === 'pending' ? `<input type="checkbox" name="ids" value="${r.id}">` : ''}</td>
               ${week ? '' : `<td class="nowrap">${weekLabel(r.week_start)}</td>`}

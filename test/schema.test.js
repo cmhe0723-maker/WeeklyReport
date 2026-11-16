@@ -39,8 +39,12 @@ const rpcUser = (uid, fields) => as(uid,
   'select public.admin_save_user($1,$2,$3,$4,$5,$6,$7,$8) as id',
   [fields.id || null, fields.username, fields.name, fields.role, fields.dept || null, fields.managed || [], fields.active ?? true, fields.password || '']
 ).then((r) => r[0].id);
-const save = (uid, id, week, work, submit) => as(uid,
-  'select public.save_report($1,$2,$3,$4,$5,$6,$7,$8) as id', [id, week, work, '', '', '', '', submit]).then((r) => r[0].id);
+// work：週一的工作內容（其餘天空白）
+const saveDays = (uid, id, week, days, submit, legacy = '') => as(uid,
+  `select public.save_report(p_id => $1, p_week => $2, p_work_summary => $3, p_daily_work => $4,
+     p_customer_visits => '', p_sales_progress => '', p_next_week_plan => '', p_issues => '', p_submit => $5) as id`,
+  [id, week, legacy, days, submit]).then((r) => r[0].id);
+const save = (uid, id, week, work, submit) => saveDays(uid, id, week, [work], submit);
 
 let admin, d1, d2, boss, amy, bob;
 const WEEK = '2026-11-16';
@@ -123,7 +127,7 @@ test('週報流程：草稿 → 提交 → 查閱 → 鎖定 → 撤回', async 
   rid = await save(amy, null, '2026-11-19', '拜訪客戶 A', false); // 週四 → 自動換算為週一
   assert.strictEqual((await sys('select week_start::text from reports where id = $1', [rid]))[0].week_start, WEEK);
   await assert.rejects(save(amy, null, WEEK, '重複', false), /該週已有週報/);
-  await assert.rejects(save(amy, rid, null, '', true), /提交前請填寫/);
+  await assert.rejects(save(amy, rid, null, '', true), /提交前請至少填寫一天/);
 
   // 草稿：主管看不到，也不能查閱
   assert.strictEqual((await as(boss, 'select id from public.reports')).length, 0);
@@ -152,7 +156,7 @@ test('週報流程：草稿 → 提交 → 查閱 → 鎖定 → 撤回', async 
 
   await as(admin, "select public.review_report($1, 'unreview', '')", [rid]);
   await save(amy, rid, null, '補充內容', true);
-  assert.strictEqual((await sys('select work_summary from reports where id = $1', [rid]))[0].work_summary, '補充內容');
+  assert.deepStrictEqual((await sys('select daily_work from reports where id = $1', [rid]))[0].daily_work, ['補充內容', '', '', '', '', '', '']);
 });
 
 test('批次查閱只會標記有權限的週報', async () => {
@@ -199,4 +203,22 @@ test('更改帳號名稱會同步登入信箱', async () => {
   await rpcUser(admin, { id: bob, username: 'bobby', name: '業務 Bob', role: 'staff', dept: d2 });
   const [u] = await sys('select u.email, i.email as identity_email from auth.users u join auth.identities i on i.user_id = u.id where u.id = $1', [bob]);
   assert.deepStrictEqual(u, { email: 'bobby@weeklyreport.example.com', identity_email: 'bobby@weeklyreport.example.com' });
+});
+
+test('每日工作內容：依週一～週日儲存、補齊 7 天、限制天數', async () => {
+  await rpcUser(admin, { id: amy, username: 'amy', name: '業務 Amy', role: 'staff', dept: d1 });
+  const id = await saveDays(amy, null, '2026-12-07', ['  拜訪 A  ', '', '報價 B'], true);
+  const [r] = await sys('select daily_work, work_summary, status from reports where id = $1', [id]);
+  assert.deepStrictEqual(r, { daily_work: ['拜訪 A', '', '報價 B', '', '', '', ''], work_summary: '', status: 'submitted' });
+  await assert.rejects(saveDays(amy, id, null, ['', '', ''], true), /提交前請至少填寫一天/);
+  await assert.rejects(saveDays(amy, id, null, ['1', '2', '3', '4', '5', '6', '7', '8'], true), /最多 7 天/);
+  // 週日也可以單獨填寫
+  await saveDays(amy, id, null, ['', '', '', '', '', '', '週日展覽'], true);
+  assert.strictEqual((await sys('select daily_work->>6 as sun from reports where id = $1', [id]))[0].sun, '週日展覽');
+  // 舊版「本週工作內容」仍可單獨提交
+  const id2 = await saveDays(amy, null, '2026-12-14', [], true, '舊版內容');
+  assert.strictEqual((await sys('select work_summary from reports where id = $1', [id2]))[0].work_summary, '舊版內容');
+  // 主管讀得到每日內容
+  const [v] = await as(boss, 'select daily_work from public.reports where id = $1', [id]);
+  assert.strictEqual(v.daily_work[6], '週日展覽');
 });
