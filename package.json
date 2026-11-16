@@ -1,0 +1,30 @@
+{
+  "name": "weekly-report",
+  "version": "1.0.0",
+  "description": "業務人員每週工作會報週報表記錄系統",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --watch --disable-warning=ExperimentalWarning src/server.js",
+    "seed:demo": "node --disable-warning=ExperimentalWarning scripts/seed-demo.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cmhe0723-maker/WeeklyReport.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cmhe0723-maker/WeeklyReport/issues"
+  },
+  "homepage": "https://github.com/cmhe0723-maker/WeeklyReport#readme",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "ejs": "^7.0.2",
+    "express": "^4.22.3",
+    "express-session": "^1.19.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  }
+}

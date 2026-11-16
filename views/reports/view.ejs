@@ -1,0 +1,79 @@
+<%- include('../partials/header') %>
+<% const st = report.status === 'draft' ? 'draft' : (report.reviewed_at ? 'reviewed' : 'pending'); %>
+<div class="page-head">
+  <div>
+    <a href="<%= backUrl %>" class="small">← 返回列表</a>
+    <h1><%= report.author_name %> 的週報 <%- include('../partials/badge', { state: st }) %></h1>
+    <div class="muted"><%= util.weekLabel(report.week_start) %>・<%= report.department_name || '未分配部門' %></div>
+  </div>
+  <% if (isOwner && !report.reviewed_at) { %>
+    <div class="row-gap">
+      <a class="btn" href="/reports/<%= report.id %>/edit">編輯</a>
+      <% if (report.status === 'draft') { %>
+      <form method="post" action="/reports/<%= report.id %>/delete" class="inline">
+        <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+        <button class="btn btn-danger" data-confirm="確定刪除這份草稿？">刪除</button>
+      </form>
+      <% } %>
+    </div>
+  <% } %>
+</div>
+
+<div class="grid-2">
+  <section class="card report-body">
+    <% const sections = [['work_summary','本週工作內容'],['customer_visits','客戶拜訪紀錄'],['sales_progress','業績與案件進度'],['next_week_plan','下週工作計畫'],['issues','問題與需協助事項']]; %>
+    <% for (const [k, label] of sections) { %>
+      <h3><%= label %></h3>
+      <div class="pre <%= report[k] ? '' : 'muted' %>"><%= report[k] || '（未填寫）' %></div>
+    <% } %>
+    <p class="muted small meta">
+      <% if (report.submitted_at) { %>提交：<%= util.fmtDateTime(report.submitted_at) %>・<% } %>最後更新：<%= util.fmtDateTime(report.updated_at) %>
+    </p>
+  </section>
+
+  <aside class="stack">
+    <section class="card review-box <%= report.reviewed_at ? 'is-reviewed' : '' %>">
+      <h3>主管查閱</h3>
+      <% if (report.status === 'draft') { %>
+        <p class="muted">草稿尚未提交，主管無法查看。</p>
+      <% } else if (report.reviewed_at) { %>
+        <p><strong>✔ 已查閱完成</strong></p>
+        <p class="small">查閱人：<%= report.reviewer_name || '—' %><br>查閱時間：<%= util.fmtDateTime(report.reviewed_at) %></p>
+        <% if (report.review_comment) { %><div class="pre comment"><%= report.review_comment %></div><% } %>
+      <% } else { %>
+        <p class="warn-text">⏳ 尚未查閱</p>
+        <% if (report.review_comment) { %><div class="pre comment"><%= report.review_comment %></div><% } %>
+      <% } %>
+
+      <% if (canReview) { %>
+        <form method="post" action="/reports/<%= report.id %>/review" class="stack">
+          <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+          <input type="hidden" name="back" value="<%= backUrl %>">
+          <label>主管意見（選填）
+            <textarea name="comment" rows="4" maxlength="2000"><%= report.review_comment %></textarea>
+          </label>
+          <% if (report.reviewed_at) { %>
+            <button class="btn" name="action" value="comment">更新意見</button>
+            <button class="btn btn-danger-outline" name="action" value="unreview" data-confirm="撤回後業務人員可再次修改此週報，確定撤回？">撤回查閱</button>
+          <% } else { %>
+            <button class="btn btn-primary" name="action" value="review">✔ 標記為查閱完成</button>
+            <button class="btn" name="action" value="comment">僅儲存意見</button>
+          <% } %>
+        </form>
+      <% } %>
+    </section>
+
+    <% if (logs.length) { %>
+    <section class="card">
+      <h3>查閱紀錄</h3>
+      <ul class="timeline">
+        <% const L = { reviewed: '標記查閱完成', unreviewed: '撤回查閱', commented: '更新意見' }; %>
+        <% for (const l of logs) { %>
+          <li><span class="small muted"><%= util.fmtDateTime(l.created_at) %></span><br><%= l.user_name || '（已刪除）' %> <%= L[l.action] %><% if (l.comment) { %>：<span class="muted"><%= l.comment %></span><% } %></li>
+        <% } %>
+      </ul>
+    </section>
+    <% } %>
+  </aside>
+</div>
+<%- include('../partials/footer') %>

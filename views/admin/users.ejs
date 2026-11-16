@@ -1,0 +1,44 @@
+<%- include('../partials/header') %>
+<div class="page-head">
+  <h1>人員與權限</h1>
+  <a class="btn btn-primary" href="/admin/users/new">＋ 新增人員</a>
+</div>
+
+<form method="get" class="card inline-form">
+  <select name="dept" data-autosubmit>
+    <option value="">全部部門</option>
+    <% for (const d of departments) { %><option value="<%= d.id %>" <%= d.id === dept ? 'selected' : '' %>><%= d.name %></option><% } %>
+  </select>
+  <noscript><button class="btn btn-sm">篩選</button></noscript>
+</form>
+
+<section class="card">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>姓名</th><th>帳號</th><th>角色</th><th>所屬部門</th><th>可查閱部門</th><th>狀態</th><th></th></tr></thead>
+    <tbody>
+    <% for (const u of users) { %>
+      <tr class="<%= u.active ? '' : 'inactive' %>">
+        <td><%= u.name %></td>
+        <td><code><%= u.username %></code></td>
+        <td><span class="tag tag-<%= u.role %>"><%= util.ROLE_LABELS[u.role] %></span></td>
+        <td><%= u.department_name || '—' %></td>
+        <td><%= u.role === 'admin' ? '全部' : (u.managed || '—') %></td>
+        <td><%= u.active ? '啟用' : '停用' %></td>
+        <td class="right"><a class="btn btn-sm" href="/admin/users/<%= u.id %>">編輯</a></td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="card muted small">
+  <strong>角色說明</strong>
+  <ul>
+    <li><b>業務人員</b>：填寫、提交自己的週報，查看主管查閱狀態與意見。</li>
+    <li><b>主管</b>：查看「可查閱部門」內人員已提交的週報，標記查閱完成並留下意見；主管本人也可填寫週報。</li>
+    <li><b>系統管理員</b>：可查閱所有部門週報，並管理部門、人員帳號與權限。</li>
+  </ul>
+</section>
+<%- include('../partials/footer') %>

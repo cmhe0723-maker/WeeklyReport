@@ -1,0 +1,40 @@
+<%- include('../partials/header') %>
+<div class="page-head"><h1>部門管理</h1></div>
+
+<form method="post" action="/admin/departments" class="card inline-form">
+  <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+  <input name="name" placeholder="新部門名稱" maxlength="50" required>
+  <button class="btn btn-primary">新增部門</button>
+</form>
+
+<section class="card">
+  <% if (!departments.length) { %><p class="muted center">尚未建立部門。</p><% } else { %>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>部門名稱</th><th>人數</th><th>負責主管</th><th></th></tr></thead>
+    <tbody>
+    <% for (const d of departments) { %>
+      <tr>
+        <td>
+          <form method="post" action="/admin/departments/<%= d.id %>" class="inline-form">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <input name="name" value="<%= d.name %>" maxlength="50" required>
+            <button class="btn btn-sm">更名</button>
+          </form>
+        </td>
+        <td><a href="/admin/users?dept=<%= d.id %>"><%= d.member_count %> 人</a></td>
+        <td><%= d.managers || '—' %></td>
+        <td class="right">
+          <form method="post" action="/admin/departments/<%= d.id %>/delete" class="inline">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <button class="btn btn-sm btn-danger-outline" data-confirm="確定刪除部門「<%= d.name %>」？" <%= d.member_count ? 'disabled title=部門仍有人員' : '' %>>刪除</button>
+          </form>
+        </td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table>
+  </div>
+  <% } %>
+</section>
+<%- include('../partials/footer') %>

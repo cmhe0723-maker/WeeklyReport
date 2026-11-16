@@ -1,0 +1,52 @@
+<%- include('../partials/header') %>
+<div class="page-head">
+  <h1>我的週報</h1>
+  <form method="get" action="/reports/new" class="inline-form">
+    <label class="sr">週次</label>
+    <input type="date" name="week" value="<%= thisWeek %>" title="選擇該週任一天">
+    <button class="btn btn-primary">填寫週報</button>
+  </form>
+</div>
+
+<section class="card highlight">
+  <div class="row-between">
+    <div>
+      <div class="muted small">本週</div>
+      <strong><%= util.weekLabel(thisWeek) %></strong>
+    </div>
+    <% if (!thisWeekReport) { %>
+      <a class="btn btn-primary" href="/reports/new?week=<%= thisWeek %>">填寫本週週報</a>
+    <% } else { %>
+      <div class="row-gap">
+        <%- include('../partials/badge', { state: thisWeekReport.status === 'draft' ? 'draft' : (thisWeekReport.reviewed_at ? 'reviewed' : 'pending') }) %>
+        <a class="btn" href="/reports/<%= thisWeekReport.id %>">查看</a>
+      </div>
+    <% } %>
+  </div>
+</section>
+
+<section class="card">
+  <% if (!reports.length) { %>
+    <p class="muted center">尚未有任何週報。</p>
+  <% } else { %>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>週次</th><th>狀態</th><th>提交時間</th><th>主管查閱</th><th></th></tr></thead>
+    <tbody>
+    <% for (const r of reports) { const st = r.status === 'draft' ? 'draft' : (r.reviewed_at ? 'reviewed' : 'pending'); %>
+      <tr>
+        <td><a href="/reports/<%= r.id %>"><%= util.weekLabel(r.week_start) %></a></td>
+        <td><%- include('../partials/badge', { state: st }) %></td>
+        <td class="nowrap"><%= util.fmtDateTime(r.submitted_at) || '—' %></td>
+        <td><% if (r.reviewed_at) { %><%= r.reviewer_name || '—' %> <span class="muted small"><%= util.fmtDateTime(r.reviewed_at) %></span><% if (r.review_comment) { %><div class="small comment-preview">💬 <%= r.review_comment %></div><% } %><% } else { %><span class="muted">—</span><% } %></td>
+        <td class="nowrap right">
+          <% if (!r.reviewed_at) { %><a href="/reports/<%= r.id %>/edit">編輯</a><% } %>
+        </td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table>
+  </div>
+  <% } %>
+</section>
+<%- include('../partials/footer') %>

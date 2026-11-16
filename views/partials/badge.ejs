@@ -1,0 +1,2 @@
+<% const map = { missing: ['未填寫', 'muted'], draft: ['草稿', 'muted'], pending: ['待查閱', 'warn'], reviewed: ['已查閱', 'ok'] }; const b = map[state]; %>
+<span class="badge badge-<%= b[1] %>"><%= b[0] %></span>
