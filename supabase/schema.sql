@@ -1,5 +1,5 @@
 -- =============================================================================
--- 業務週報系統 — Supabase 建表 SQL
+-- 工作週報系統 — Supabase 建表 SQL
 --
 -- 架構：網頁（GitHub Pages 靜態網站）以 publishable key 直接連 Supabase。
 --   * 登入：Supabase Auth（帳號 username 對應到 username@weeklyreport.example.com，
