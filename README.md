@@ -2,6 +2,9 @@
 
 業務人員記錄每週工作會報的網站。管理員設定部門與人員的登入權限，主管登入後查看所屬部門的週報，並記錄是否已查閱完成。
 
+- 網站：<https://cmhe0723-maker.github.io/WeeklyReport/>（GitHub Pages）
+- 資料庫與登入：Supabase
+
 ## 功能
 
 | 角色 | 可以做的事 |
@@ -10,81 +13,96 @@
 | **主管** | 查看「可查閱部門」內人員**已提交**的週報；標記「查閱完成」（記錄查閱人與時間）、留下意見、撤回查閱；可批次標記；可依週次／部門／狀態篩選，並看到每週誰還沒交；主管本人也能填寫週報 |
 | **系統管理員** | 查閱所有部門週報；新增／更名／刪除部門；新增人員、設定角色、所屬部門、主管可查閱的部門、重設密碼、停用帳號 |
 
-其他細節：
-
 - 週次以「週一～週日」為一週，選擇該週任一天即可，每人每週一份。
-- 主管標記查閱完成後，業務人員就不能再修改該週報；主管撤回查閱後才可再修改。
-- 每次標記、撤回、更新意見都會記在「查閱紀錄」。
+- 主管標記查閱完成後，業務人員就不能再修改；主管撤回查閱後才可再修改。每次標記、撤回、更新意見都會留下查閱紀錄。
 - 草稿只有本人看得到。
-- 填寫新週報時，會顯示上一份週報的「下週工作計畫」供參考。
 - 新帳號或被重設密碼的帳號，首次登入時必須自行變更密碼。
-- 停用帳號立即生效，已登入的工作階段也會失效。
-- 安全性：密碼以 bcrypt 雜湊、所有表單有 CSRF 保護、同帳號連續登入失敗 5 次鎖定 15 分鐘。
+- 停用帳號立即生效（無法登入，已登入的裝置也讀不到任何資料）。
 
-## 安裝與啟動
+## 架構與安全
 
-需求：Node.js 22.13 以上（使用內建 SQLite，不需另外安裝資料庫）。
+```
+瀏覽器（docs/，GitHub Pages 靜態網站）
+   │  supabase-js + publishable key
+   ▼
+Supabase
+   ├─ Auth：帳號密碼登入
+   ├─ 資料表：Row Level Security，只開放「讀取自己有權限的資料」
+   └─ 資料庫函式（RPC）：所有新增／修改／查閱／管理動作，函式內檢查權限
+```
+
+- publishable key 本來就是公開的金鑰，網頁原始碼中看得到是正常的；資料安全完全由資料庫端的 RLS 與函式把關，前端無法直接寫入任何資料表。
+- 帳號 `amy` 在 Supabase Auth 中對應的登入信箱是 `amy@weeklyreport.example.com`。這只是登入識別，不會寄信。
+- **請勿**把 Supabase 的 secret key / service_role key 放進本專案。
+
+## 第一次設定
+
+### 1. 在 Supabase 建立資料表
+
+Supabase Dashboard → **SQL Editor** → New query → 貼上 [`supabase/schema.sql`](supabase/schema.sql) 全部內容 → **Run**。
+
+會同時建立預設管理員：帳號 `admin`、密碼 `admin1234`（首次登入會要求變更）。之後更新版本時重新執行同一個檔案即可，不會影響既有資料。
+
+### 2. 關閉 Supabase 的自行註冊（建議）
+
+Dashboard → **Authentication** → **Sign In / Providers** → 關閉 **Allow new users to sign up**，並確認 **Email** 登入方式為啟用。
+
+本系統的帳號一律由管理員在網站上建立，關閉自行註冊可避免陌生人在 Supabase 建立帳號（即使建立了，沒有人員資料也讀不到任何東西）。
+
+### 3. 開啟 GitHub Pages
+
+GitHub repository → **Settings** → **Pages** → Build and deployment：
+
+- Source：**Deploy from a branch**
+- Branch：**main**，資料夾 **/docs** → **Save**
+
+約 1 分鐘後即可開啟 <https://cmhe0723-maker.github.io/WeeklyReport/>。
+
+### 4. 開始使用
+
+1. 以 `admin` / `admin1234` 登入並變更密碼。
+2. 「部門管理」新增部門。
+3. 「人員與權限」新增人員：業務選「業務人員」並選所屬部門；主管選「主管」並勾選可查閱的部門。
+4. 業務登入後在「我的週報」填寫並提交；主管在「週報查閱」查看並標記查閱完成。
+
+## 設定
+
+[`docs/config.js`](docs/config.js)：Supabase 網址、publishable key、時區。換 Supabase 專案時修改這個檔案即可。
+
+## 本機預覽
+
+```bash
+npm run serve
+```
+
+開啟 http://localhost:8080 （會連到 config.js 設定的 Supabase）。
+
+## 測試
 
 ```bash
 npm install
 ```
 
-```bash
-npm start
-```
-
-開啟 http://localhost:3000 ，以預設管理員登入：
-
-- 帳號：`admin`
-- 密碼：`admin1234`（首次登入會要求變更）
-
-### 建議使用順序
-
-1. 管理員到「部門管理」新增部門（例如：北區業務部、南區業務部）。
-2. 到「人員與權限」新增人員：
-   - 業務人員：角色選「業務人員」，選擇所屬部門。
-   - 主管：角色選「主管」，並勾選他可查閱的部門（可多個）。
-3. 業務人員登入後在「我的週報」填寫並提交。
-4. 主管登入後在「週報查閱」查看本週提交狀況，點進週報後按「標記為查閱完成」。
-
-### 示範資料（選用）
+資料庫權限測試需要一個**可以清空**的 PostgreSQL 資料庫（會模擬 Supabase 的 auth 與角色），請勿指向正式的 Supabase：
 
 ```bash
-npm run seed:demo
+TEST_DATABASE_URL=postgresql://postgres@localhost:5432/wr_test npm test
 ```
 
-會建立兩個部門、兩位主管（`manager.north`、`manager.south`）與三位業務（`sales.chen`、`sales.lin`、`sales.huang`），密碼皆為 `demo1234`。
-
-## 設定（環境變數）
-
-| 變數 | 預設值 | 說明 |
-| --- | --- | --- |
-| `PORT` | `3000` | 服務埠號 |
-| `DB_PATH` | `data/weekly-report.db` | SQLite 資料庫檔案位置（請定期備份此檔案） |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin1234` | 第一次啟動（資料庫沒有任何帳號）時建立的管理員 |
-| `APP_TIMEZONE` | `Asia/Taipei` | 計算「本週」與顯示時間所用的時區 |
-| `SESSION_SECRET` | 自動產生並存於資料庫 | Session 簽章金鑰 |
-| `COOKIE_SECURE` | 未設定 | 以 HTTPS 對外服務時設為 `1` |
-| `TRUST_PROXY` | 未設定 | 架在反向代理（Nginx 等）後方時設為 `1` |
-
-## 測試
-
-```bash
-npm test
-```
+前端畫面測試需要 Playwright，會攔截所有 Supabase 請求改用模擬資料，不會連到正式環境。未設定資料庫或未安裝 Playwright 時，對應的測試會自動略過。
 
 ## 專案結構
 
 ```
-src/
-  server.js          啟動入口
-  app.js             Express 設定、Session、CSRF
-  db.js              資料表結構與初始化
-  auth.js            登入檢查與權限判斷
-  util.js            週次與日期工具
-  routes/            auth / reports / review / admin
-views/               EJS 頁面
-public/              CSS 與前端 JS
-scripts/seed-demo.js 示範資料
-test/                整合測試
+docs/                    GitHub Pages 網站
+  index.html
+  app.js                 所有頁面與操作
+  config.js              Supabase 連線設定
+  style.css
+  vendor/                supabase-js 2.118.0（MIT）
+supabase/schema.sql      資料表、RLS、資料庫函式、預設管理員
+test/schema.test.js      資料庫權限測試
+test/supabase-mock.sql   測試用：在一般 PostgreSQL 模擬 Supabase
+test/ui.test.js          前端畫面測試
+scripts/serve.js         本機預覽
 ```
