@@ -108,16 +108,38 @@
   function pct(a, b) {
     return b ? Math.round((a * 100) / b) + '%' : '—';
   }
+  // 民國年日期，例：115.11.17
+  function rocDate(iso) {
+    const [y, m, d] = dateInTZ(iso).split('-');
+    return `${Number(y) - 1911}.${m}.${d}`;
+  }
+  // 主管查閱後蓋在週報上的日期章
+  let justReviewed = null;
+  function sealHtml(report) {
+    if (!report.reviewed_at) return '';
+    const fresh = justReviewed === report.id;
+    if (fresh) justReviewed = null;
+    return `<div class="seal ${fresh ? 'seal-fresh' : ''}" role="img"
+      aria-label="${esc(`${report.reviewer_name || '主管'} 已於 ${fmtDateTime(report.reviewed_at)} 查閱`)}">
+      <span class="seal-top">已閱</span><span class="seal-date">${rocDate(report.reviewed_at)}</span><span class="seal-name">${esc(report.reviewer_name || '主管')}</span>
+    </div>`;
+  }
   // 週報內容（檢視頁與列印頁共用）
-  function reportBodyHtml(report) {
+  function reportBodyHtml(report, deptLabel) {
     return `
+      ${sealHtml(report)}
+      <dl class="doc-head">
+        <div><dt>週次</dt><dd>${weekLabel(report.week_start)}</dd></div>
+        <div><dt>部門</dt><dd>${esc(deptLabel || '未分配部門')}</dd></div>
+        <div><dt>提交</dt><dd>${report.submitted_at ? fmtDateTime(report.submitted_at) : '尚未提交'}</dd></div>
+        <div><dt>最後更新</dt><dd>${fmtDateTime(report.updated_at)}</dd></div>
+      </dl>
       <h3>每日工作內容</h3>
       <div class="daily-view">${dailyOf(report).map((t, i) => (i < 5 || t ? `<div class="day-row">
         <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
         <div class="pre ${t ? '' : 'muted'}">${esc(t || '（未填寫）')}</div></div>` : '')).join('')}</div>
       ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
-      ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}
-      <p class="muted small meta">${report.submitted_at ? `提交：${fmtDateTime(report.submitted_at)}・` : ''}最後更新：${fmtDateTime(report.updated_at)}</p>`;
+      ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}`;
   }
   // 主管查閱狀態（不含操作表單）
   function reviewStatusHtml(report) {
@@ -183,17 +205,17 @@
   function layout(body, section) {
     const f = flash;
     flash = null;
-    const dept = me.department ? '・' + esc(me.department.name) : '';
+    const dept = me.department ? esc(me.department.name) + ' ' : '';
     root.innerHTML = `
       <header class="topbar"><div class="topbar-inner">
-        <a class="brand" href="#/">工作週報系統</a>
+        <a class="brand" href="#/"><span class="brand-seal" aria-hidden="true">週</span>工作週報系統</a>
         <nav class="nav">
           ${isWriter() ? navLink('/reports', '我的週報', section === 'reports') : ''}
           ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') + navLink('/stats', '繳交統計', section === 'stats') : ''}
           ${me.role === 'admin' ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
         </nav>
         <div class="me">
-          <span class="me-name">${esc(me.name)}<small>${ROLE_LABELS[me.role]}${dept}</small></span>
+          <span class="me-name">${esc(me.name)}<small>${dept}${ROLE_LABELS[me.role]}</small></span>
           <a href="#/password">變更密碼</a>
           <button class="link" data-logout>登出</button>
         </div>
@@ -247,7 +269,8 @@
   /* ------------------------------------------------------------------ 登入 */
   function renderLogin(error, username, next) {
     root.innerHTML = `
-      <main class="container"><section class="login">
+      <main class="container login-page"><section class="login">
+        <span class="brand-seal brand-seal-lg" aria-hidden="true">週</span>
         <h1>工作週報系統</h1>
         <p class="muted">請使用您的帳號登入</p>
         <form class="stack" data-login>
@@ -452,7 +475,6 @@
         <div>
           <a href="#${esc(back)}" class="small no-print">← 返回列表</a>
           <h1>${esc(author.name || me.name)} 的週報 ${badge(state)}</h1>
-          <div class="muted">${weekLabel(report.week_start)}・${esc((author.department && author.department.name) || '未分配部門')}</div>
         </div>
         <div class="row-gap no-print">
           ${isOwner && !report.reviewed_at ? `<a class="btn" href="#/reports/${report.id}/edit">編輯</a>
@@ -461,7 +483,7 @@
         </div>
       </div>
       <div class="grid-2">
-        <section class="card report-body">${reportBodyHtml(report)}</section>
+        <section class="card sheet report-body">${reportBodyHtml(report, author.department && author.department.name)}</section>
         <aside class="stack">
           <section class="card review-box ${report.reviewed_at ? 'is-reviewed' : ''}">
             <h3>主管查閱</h3>
@@ -491,6 +513,7 @@
     const form = root.querySelector('[data-review]');
     if (form) onSubmit(form, async (fd, action) => {
       must(await sb.rpc('review_report', { p_id: report.id, p_action: action, p_comment: String(fd.get('comment') || '') }));
+      if (action === 'review') justReviewed = report.id;
       setFlash('success', { review: '已標記為「查閱完成」。', unreview: '已撤回查閱狀態，業務人員可再次修改。', comment: '主管意見已更新。' }[action]);
       go(`/reports/${report.id}${qs({ back: query.get('back') })}`);
     });
@@ -663,7 +686,7 @@
         <div>
           <a href="#${esc(back)}" class="small">← 返回週報查閱</a>
           <h1>列印週報</h1>
-          <div class="muted">${weekLabel(week)}・${esc(scopeLabel)}${status ? '・' + (status === 'pending' ? '待查閱' : '已查閱') : ''}・共 ${reports.length} 份</div>
+          <div class="muted">${weekLabel(week)}，${esc(scopeLabel)}${status ? '，只含' + (status === 'pending' ? '待查閱' : '已查閱') : ''}，共 ${reports.length} 份</div>
         </div>
         ${reports.length ? printButton(`列印／輸出 PDF（${reports.length} 份）`) : ''}
       </div>
@@ -672,9 +695,8 @@
         <article class="card print-report">
           <header class="print-report-head">
             <h2>${esc(r.author.name)} 的週報 ${badge(reportState(r))}</h2>
-            <div class="muted">${weekLabel(r.week_start)}・${esc(deptName[r.author.department_id] || '未分配部門')}</div>
           </header>
-          <div class="report-body">${reportBodyHtml(r)}</div>
+          <div class="sheet report-body">${reportBodyHtml(r, deptName[r.author.department_id])}</div>
           <section class="review-box print-review ${r.reviewed_at ? 'is-reviewed' : ''}"><h3>主管查閱</h3>${reviewStatusHtml(r)}</section>
         </article>`).join('')}`, 'review');
   }
@@ -753,7 +775,7 @@
       <div class="page-head">
         <div>
           <h1>繳交統計</h1>
-          <div class="muted">統計期間：${from.replace(/-/g, '/')} ～ ${addDays(to, 6).replace(/-/g, '/')}（共 ${n} 週）・${esc(deptFilter ? deptName[deptFilter] : '全部部門')}</div>
+          <div class="muted">${esc(deptFilter ? deptName[deptFilter] : '全部部門')}，${from.replace(/-/g, '/')} ～ ${addDays(to, 6).replace(/-/g, '/')}，共 ${n} 週</div>
         </div>
         ${printButton()}
       </div>

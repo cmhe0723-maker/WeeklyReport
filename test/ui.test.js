@@ -188,6 +188,24 @@ async function handleSupabase(route) {
   return json(200, rows, { 'content-range': `0-${Math.max(rows.length - 1, 0)}/*` });
 }
 
+// 外部字型：預設回傳空白（測試不依賴網路）；REAL_FONTS=1 時以 curl 下載，供檢視設計截圖
+const fontCache = new Map();
+async function fontRoute(route) {
+  const url = route.request().url();
+  if (!process.env.REAL_FONTS) return route.fulfill({ status: 200, contentType: 'text/css', body: '' });
+  if (!fontCache.has(url)) {
+    const ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36';
+    fontCache.set(url, require('node:child_process').execFileSync('curl', ['-sS', '-m', '30', '-A', ua, url]));
+  }
+  return route.fulfill({ status: 200, contentType: url.includes('googleapis') ? 'text/css' : 'font/woff2', headers: { 'access-control-allow-origin': '*' }, body: fontCache.get(url) });
+}
+// 設計檢視用截圖（設定 SHOT_DIR 時才輸出）
+async function shot(page, name) {
+  if (!process.env.SHOT_DIR) return;
+  await page.evaluate(() => Promise.all([document.fonts.ready, ...document.getAnimations().map((a) => a.finished)]));
+  await page.screenshot({ path: path.join(process.env.SHOT_DIR, name + '.png'), fullPage: true });
+}
+
 /* ---------- 測試 ---------- */
 let server, base, browser;
 const errors = [];
@@ -210,6 +228,7 @@ test.after(async () => {
 async function login(username, viewport) {
   const ctx = await browser.newContext({ viewport: viewport || { width: 1280, height: 800 } });
   await ctx.route(SUPABASE + '/**', handleSupabase);
+  await ctx.route(/^https:\/\/fonts\.(googleapis|gstatic)\.com\//, fontRoute);
   const page = await ctx.newPage();
   page.on('pageerror', (e) => errors.push(`${username}: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(`${username}: ${m.text()}`); });
@@ -225,12 +244,14 @@ async function login(username, viewport) {
 test('未登入導向登入頁、密碼錯誤顯示訊息', async () => {
   const ctx = await browser.newContext();
   await ctx.route(SUPABASE + '/**', handleSupabase);
+  await ctx.route(/^https:\/\/fonts\.(googleapis|gstatic)\.com\//, fontRoute);
   const page = await ctx.newPage();
   await page.goto(base + '#/review');
   await page.waitForSelector('input[name=username]');
   assert.match(page.url(), /#\/login\?next=%2Freview/);
   assert.strictEqual(await page.textContent('.login h1'), '工作週報系統');
   assert.strictEqual(await page.title(), '工作週報系統');
+  await shot(page, 'd-login');
   await page.fill('input[name=username]', 'amy');
   await page.fill('input[name=password]', 'wrong');
   await page.click('button.btn-primary');
@@ -243,6 +264,7 @@ test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () =
   const page = await login('boss');
   await page.waitForSelector('.stats');
   assert.match(page.url(), /#\/review$/);
+  await shot(page, 'd-review');
   const body = await page.textContent('main');
   assert.match(body, /陳小明/);
   assert.doesNotMatch(body, /黃大偉/, '其他部門人員不應出現');
@@ -263,7 +285,7 @@ test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () =
   assert.match(await page.textContent('.alert-success'), /查閱完成/);
   assert.match(await page.textContent('.timeline'), /王經理 標記查閱完成/);
   assert.deepStrictEqual(rpcCalls.at(-1), { fn: 'review_report', args: { p_id: 1, p_action: 'review', p_comment: '做得好' }, uid: U.boss });
-  await page.screenshot({ path: path.join(process.env.SHOT_DIR || '/tmp', 'ui-report-view.png'), fullPage: true });
+  await shot(page, 'ui-report-view');
   await page.context().close();
 });
 
@@ -271,6 +293,7 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   const page = await login('amy');
   await page.waitForSelector('.highlight');
   assert.match(page.url(), /#\/reports$/);
+  await shot(page, 'd-mine');
   assert.match(await page.textContent('table'), /已查閱/);
   assert.match(await page.textContent('table'), /做得好/);
   assert.strictEqual(await page.$('a[href="#/review"]'), null, '業務不應看到查閱選單');
@@ -289,7 +312,7 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   await page.fill('textarea[name=day2]', '準備報價');
   await page.click('details.weekend summary');
   await page.fill('textarea[name=day6]', '週日拜訪');
-  await page.screenshot({ path: path.join(process.env.SHOT_DIR || '/tmp', 'ui-daily-form.png'), fullPage: true });
+  await shot(page, 'ui-daily-form');
   await page.click('button[value=submit]');
   await page.waitForSelector('.report-body');
   const call = rpcCalls.at(-1);
@@ -350,6 +373,7 @@ test('繳交統計：管理員看全部部門、數字正確', async () => {
     ['黃大偉', ['cell-na', 'cell-na', 'cell-na', 'cell-muted'], '0／0', '—'],
   ]);
   assert.match(await page.textContent('.stats'), /應繳份數[\s\S]*29%[\s\S]*未繳份數/);
+  await shot(page, 'd-stats');
   // 點格子開啟週報，並能返回統計
   await page.click('.stats-table.grid a.cell-ok');
   await page.waitForSelector('.report-body');
@@ -425,7 +449,7 @@ test('管理員：人員列表、人員表單、部門管理', async () => {
   await page.waitForSelector('h1:has-text("人員與權限")');
   const text = await page.textContent('table');
   for (const n of ['王經理', '陳小明', '黃大偉', '系統管理員']) assert.match(text, new RegExp(n));
-  await page.screenshot({ path: path.join(process.env.SHOT_DIR || '/tmp', 'ui-users.png'), fullPage: true });
+  await shot(page, 'ui-users');
 
   await page.click(`a[href="#/admin/users/${U.boss}"]`);
   await page.waitForSelector('[data-managed]');
@@ -457,7 +481,11 @@ test('手機版面不會水平捲動', async () => {
   await page.waitForSelector('.stats');
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
   assert.strictEqual(overflow, false);
-  await page.screenshot({ path: path.join(process.env.SHOT_DIR || '/tmp', 'ui-review-mobile.png'), fullPage: true });
+  await shot(page, 'ui-review-mobile');
+  await page.goto(base + '#/reports/1');
+  await page.waitForSelector('.seal');
+  assert.strictEqual(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+  await shot(page, 'd-report-mobile');
   await page.context().close();
 });
 
