@@ -91,6 +91,55 @@
     if (r.work_summary) parts.push(r.work_summary.replace(/\s+/g, ' '));
     return parts.join('；');
   }
+  // ISO 時間 → 指定時區的日期 YYYY-MM-DD
+  function dateInTZ(iso) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+  }
+  // Supabase 每次最多回傳 1000 筆，超過時分頁讀取。build() 每次須回傳新的查詢
+  async function fetchAll(build) {
+    const size = 1000;
+    let out = [];
+    for (let from = 0; ; from += size) {
+      const rows = must(await build().range(from, from + size - 1));
+      out = out.concat(rows);
+      if (rows.length < size) return out;
+    }
+  }
+  function pct(a, b) {
+    return b ? Math.round((a * 100) / b) + '%' : '—';
+  }
+  // 週報內容（檢視頁與列印頁共用）
+  function reportBodyHtml(report) {
+    return `
+      <h3>每日工作內容</h3>
+      <div class="daily-view">${dailyOf(report).map((t, i) => (i < 5 || t ? `<div class="day-row">
+        <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
+        <div class="pre ${t ? '' : 'muted'}">${esc(t || '（未填寫）')}</div></div>` : '')).join('')}</div>
+      ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
+      ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}
+      <p class="muted small meta">${report.submitted_at ? `提交：${fmtDateTime(report.submitted_at)}・` : ''}最後更新：${fmtDateTime(report.updated_at)}</p>`;
+  }
+  // 主管查閱狀態（不含操作表單）
+  function reviewStatusHtml(report) {
+    if (report.status === 'draft') return '<p class="muted">草稿尚未提交，主管無法查看。</p>';
+    const comment = report.review_comment ? `<div class="pre comment">${esc(report.review_comment)}</div>` : '';
+    if (report.reviewed_at) {
+      return `<p><strong>✔ 已查閱完成</strong></p>
+        <p class="small">查閱人：${esc(report.reviewer_name || '—')}<br>查閱時間：${fmtDateTime(report.reviewed_at)}</p>${comment}`;
+    }
+    return `<p class="warn-text">⏳ 尚未查閱</p>${comment}`;
+  }
+  const PRINT_TIP = '在列印視窗的「目的地」選擇「另存為 PDF」，即可輸出 PDF 檔。';
+  function printButton(label) {
+    return `<button class="btn btn-primary no-print" data-print title="${esc(PRINT_TIP)}">🖨 ${label || '列印／輸出 PDF'}</button>`;
+  }
+  function bindPrint() {
+    root.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', () => window.print()));
+  }
+  // 查看週報後可返回的列表頁
+  function safeBack(v) {
+    return typeof v === 'string' && /^\/(review|stats|print)(\?|$)/.test(v) ? v : null;
+  }
   function badge(state) {
     const [t, c] = { missing: ['未提交', 'muted'], draft: ['草稿', 'muted'], pending: ['待查閱', 'warn'], reviewed: ['已查閱', 'ok'] }[state];
     return `<span class="badge badge-${c}">${t}</span>`;
@@ -140,7 +189,7 @@
         <a class="brand" href="#/">工作週報系統</a>
         <nav class="nav">
           ${isWriter() ? navLink('/reports', '我的週報', section === 'reports') : ''}
-          ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') : ''}
+          ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') + navLink('/stats', '繳交統計', section === 'stats') : ''}
           ${me.role === 'admin' ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
         </nav>
         <div class="me">
@@ -149,7 +198,8 @@
           <button class="link" data-logout>登出</button>
         </div>
       </div></header>
-      <main class="container">
+      <main class="container ${section ? 'page-' + section : ''}">
+        <div class="print-only print-meta">工作週報系統　列印人：${esc(me.name)}　列印時間：${fmtDateTime(new Date().toISOString())}</div>
         ${f ? `<div class="alert alert-${esc(f.type)}">${esc(f.text)}</div>` : ''}
         ${body}
       </main>`;
@@ -159,6 +209,7 @@
       go('/login');
     });
     bindCommon();
+    bindPrint();
     window.scrollTo(0, 0);
   }
   function errorPage(title, message) {
@@ -392,40 +443,29 @@
     const isOwner = report.user_id === me.id;
     const author = report.author || {};
     const reviewable = canReview(report, author.department_id);
-    const back = (query.get('back') || '').startsWith('/review') ? query.get('back') : (isOwner ? '/reports' : '/review');
+    const back = safeBack(query.get('back')) || (isOwner ? '/reports' : '/review');
     const state = reportState(report);
     const L = { reviewed: '標記查閱完成', unreviewed: '撤回查閱', commented: '更新意見' };
 
     layout(`
       <div class="page-head">
         <div>
-          <a href="#${esc(back)}" class="small">← 返回列表</a>
+          <a href="#${esc(back)}" class="small no-print">← 返回列表</a>
           <h1>${esc(author.name || me.name)} 的週報 ${badge(state)}</h1>
           <div class="muted">${weekLabel(report.week_start)}・${esc((author.department && author.department.name) || '未分配部門')}</div>
         </div>
-        ${isOwner && !report.reviewed_at ? `<div class="row-gap">
-          <a class="btn" href="#/reports/${report.id}/edit">編輯</a>
-          ${report.status === 'draft' ? '<button class="btn btn-danger" data-delete data-confirm="確定刪除這份草稿？">刪除</button>' : ''}
-        </div>` : ''}
+        <div class="row-gap no-print">
+          ${isOwner && !report.reviewed_at ? `<a class="btn" href="#/reports/${report.id}/edit">編輯</a>
+            ${report.status === 'draft' ? '<button class="btn btn-danger" data-delete data-confirm="確定刪除這份草稿？">刪除</button>' : ''}` : ''}
+          ${printButton()}
+        </div>
       </div>
       <div class="grid-2">
-        <section class="card report-body">
-          <h3>每日工作內容</h3>
-          <div class="daily-view">${dailyOf(report).map((t, i) => (i < 5 || t ? `<div class="day-row">
-            <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
-            <div class="pre ${t ? '' : 'muted'}">${esc(t || '（未填寫）')}</div></div>` : '')).join('')}</div>
-          ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
-          ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}
-          <p class="muted small meta">${report.submitted_at ? `提交：${fmtDateTime(report.submitted_at)}・` : ''}最後更新：${fmtDateTime(report.updated_at)}</p>
-        </section>
+        <section class="card report-body">${reportBodyHtml(report)}</section>
         <aside class="stack">
           <section class="card review-box ${report.reviewed_at ? 'is-reviewed' : ''}">
             <h3>主管查閱</h3>
-            ${report.status === 'draft' ? '<p class="muted">草稿尚未提交，主管無法查看。</p>'
-              : report.reviewed_at ? `<p><strong>✔ 已查閱完成</strong></p>
-                  <p class="small">查閱人：${esc(report.reviewer_name || '—')}<br>查閱時間：${fmtDateTime(report.reviewed_at)}</p>
-                  ${report.review_comment ? `<div class="pre comment">${esc(report.review_comment)}</div>` : ''}`
-              : `<p class="warn-text">⏳ 尚未查閱</p>${report.review_comment ? `<div class="pre comment">${esc(report.review_comment)}</div>` : ''}`}
+            ${reviewStatusHtml(report)}
             ${reviewable ? `<form class="stack" data-review>
               <div data-error></div>
               <label>主管意見（選填）<textarea name="comment" rows="4" maxlength="2000">${esc(report.review_comment)}</textarea></label>
@@ -434,7 +474,7 @@
                 : '<button class="btn btn-primary" value="review">✔ 標記為查閱完成</button><button class="btn" value="comment">僅儲存意見</button>'}
             </form>` : ''}
           </section>
-          ${logs.length ? `<section class="card"><h3>查閱紀錄</h3><ul class="timeline">
+          ${logs.length ? `<section class="card review-log"><h3>查閱紀錄</h3><ul class="timeline">
             ${logs.map((l) => `<li><span class="small muted">${fmtDateTime(l.created_at)}</span><br>${esc(l.user_name || '—')} ${L[l.action]}${l.comment ? `：<span class="muted">${esc(l.comment)}</span>` : ''}</li>`).join('')}
           </ul></section>` : ''}
         </aside>
@@ -532,7 +572,10 @@
           </select>
         </div>
       </form>
-      ${week ? `<h2 class="section-title">${weekLabel(week)}</h2>
+      ${week ? `<div class="row-between section-title-row">
+          <h2 class="section-title">${weekLabel(week)}</h2>
+          ${summary && summary.pending + summary.reviewed ? `<a class="btn btn-sm" href="#/print${qs({ week, dept: deptFilter || '', status: status === 'pending' || status === 'reviewed' ? status : '' })}">🖨 列印本週週報（${status === 'pending' ? summary.pending : status === 'reviewed' ? summary.reviewed : summary.pending + summary.reviewed} 份）</a>` : ''}
+        </div>
         <div class="stats">
           <div class="stat"><span>${summary ? summary.total : 0}</span>應填人數</div>
           <div class="stat stat-muted"><span>${summary ? summary.missing : 0}</span>未提交</div>
@@ -580,6 +623,198 @@
       setFlash(n ? 'success' : 'warning', n ? `已將 ${n} 份週報標記為查閱完成。` : '沒有可標記的週報。');
       go(backUrl);
     });
+  }
+
+  // 主管／管理員可查閱的部門
+  async function reviewScope(query) {
+    const allDepts = must(await sb.from('departments').select('id, name').order('name'));
+    const departments = me.role === 'admin' ? allDepts : allDepts.filter((d) => myManaged.includes(d.id));
+    const deptIds = departments.map((d) => d.id);
+    const deptFilter = Number(query.get('dept')) || 0;
+    return {
+      departments,
+      deptName: Object.fromEntries(allDepts.map((d) => [d.id, d.name])),
+      deptFilter: deptIds.includes(deptFilter) ? deptFilter : 0,
+      scopeIds: deptIds.includes(deptFilter) ? [deptFilter] : deptIds,
+    };
+  }
+  const byDeptRoleName = (deptName) => (a, b) => (deptName[a.department_id] || '').localeCompare(deptName[b.department_id] || '', 'zh-Hant')
+    || (a.role === b.role ? 0 : a.role === 'staff' ? -1 : 1) || a.name.localeCompare(b.name, 'zh-Hant');
+
+  /* ------------------------------------------------------------------ 列印多份週報 */
+  async function pagePrint(query) {
+    if (!isReviewer()) return forbidden();
+    const { deptName, deptFilter, scopeIds } = await reviewScope(query);
+    const week = weekStartOf(query.get('week') || '') || currentWeekStart();
+    const status = ['pending', 'reviewed'].includes(query.get('status')) ? query.get('status') : '';
+    let reports = scopeIds.length ? await fetchAll(() => sb.from('reports')
+      .select('*, author:profiles!reports_user_id_fkey!inner(name, role, department_id)')
+      .eq('week_start', week).eq('status', 'submitted').neq('user_id', me.id)
+      .in('author.department_id', scopeIds).order('id')) : [];
+    if (status === 'pending') reports = reports.filter((r) => !r.reviewed_at);
+    if (status === 'reviewed') reports = reports.filter((r) => r.reviewed_at);
+    const sortKey = byDeptRoleName(deptName);
+    reports.sort((a, b) => sortKey({ ...a.author }, { ...b.author }));
+    const scopeLabel = deptFilter ? deptName[deptFilter] : '全部部門';
+    const back = '/review' + qs({ week, dept: deptFilter || '', status });
+
+    layout(`
+      <div class="page-head no-print">
+        <div>
+          <a href="#${esc(back)}" class="small">← 返回週報查閱</a>
+          <h1>列印週報</h1>
+          <div class="muted">${weekLabel(week)}・${esc(scopeLabel)}${status ? '・' + (status === 'pending' ? '待查閱' : '已查閱') : ''}・共 ${reports.length} 份</div>
+        </div>
+        ${reports.length ? printButton(`列印／輸出 PDF（${reports.length} 份）`) : ''}
+      </div>
+      ${reports.length ? `<div class="alert alert-info no-print">${PRINT_TIP}每份週報會從新的一頁開始。</div>` : '<p class="card muted center">這一週沒有可列印的已提交週報。</p>'}
+      ${reports.map((r) => `
+        <article class="card print-report">
+          <header class="print-report-head">
+            <h2>${esc(r.author.name)} 的週報 ${badge(reportState(r))}</h2>
+            <div class="muted">${weekLabel(r.week_start)}・${esc(deptName[r.author.department_id] || '未分配部門')}</div>
+          </header>
+          <div class="report-body">${reportBodyHtml(r)}</div>
+          <section class="review-box print-review ${r.reviewed_at ? 'is-reviewed' : ''}"><h3>主管查閱</h3>${reviewStatusHtml(r)}</section>
+        </article>`).join('')}`, 'review');
+  }
+
+  /* ------------------------------------------------------------------ 繳交統計 */
+  async function pageStats(query) {
+    if (!isReviewer()) return forbidden();
+    const { departments, deptName, deptFilter, scopeIds } = await reviewScope(query);
+    const thisWeek = currentWeekStart();
+    const to = weekStartOf(query.get('to') || '') || thisWeek;
+    const n = [4, 8, 12, 26].includes(Number(query.get('weeks'))) ? Number(query.get('weeks')) : 8;
+    const weeks = Array.from({ length: n }, (_, i) => addDays(to, -7 * (n - 1 - i)));
+    const from = weeks[0];
+    const here = (o) => '/stats' + qs({ to, weeks: n, dept: deptFilter || '', ...o });
+
+    let people = [];
+    let reports = [];
+    if (scopeIds.length) {
+      people = must(await sb.from('profiles').select('id, name, role, department_id, created_at')
+        .eq('active', true).in('role', ['staff', 'manager']).neq('id', me.id).in('department_id', scopeIds));
+      reports = await fetchAll(() => sb.from('reports').select('id, user_id, week_start, status, submitted_at, reviewed_at')
+        .eq('status', 'submitted').gte('week_start', from).lte('week_start', to).order('id'));
+    }
+    people.sort(byDeptRoleName(deptName));
+    const byKey = Object.fromEntries(reports.map((r) => [r.user_id + '|' + r.week_start, r]));
+
+    // 每一格：reviewed 已查閱、pending 待查閱、missing 未繳、ongoing 本週進行中（不計）、na 尚未到職（不計）
+    const cellOf = (p, w) => {
+      const r = byKey[p.id + '|' + w];
+      if (r) return { state: r.reviewed_at ? 'reviewed' : 'pending', r, onTime: dateInTZ(r.submitted_at) <= addDays(w, 6) };
+      if (p.created_at && w < weekStartOf(dateInTZ(p.created_at))) return { state: 'na' };
+      if (w >= thisWeek) return { state: 'ongoing' };
+      return { state: 'missing' };
+    };
+    const empty = () => ({ due: 0, submitted: 0, onTime: 0, reviewed: 0 });
+    const add = (acc, c) => {
+      if (c.state === 'na' || c.state === 'ongoing') return;
+      acc.due += 1;
+      if (c.r) {
+        acc.submitted += 1;
+        if (c.onTime) acc.onTime += 1;
+        if (c.state === 'reviewed') acc.reviewed += 1;
+      }
+    };
+    const rows = people.map((p) => {
+      const cells = weeks.map((w) => cellOf(p, w));
+      const sum = empty();
+      cells.forEach((c) => add(sum, c));
+      return { p, cells, sum };
+    });
+    const total = empty();
+    const byDept = {};
+    const byWeek = weeks.map(() => empty());
+    for (const row of rows) {
+      const d = (byDept[row.p.department_id] = byDept[row.p.department_id] || { people: 0, ...empty() });
+      d.people += 1;
+      row.cells.forEach((c, i) => { add(d, c); add(total, c); add(byWeek[i], c); });
+    }
+    const deptRows = departments.filter((d) => scopeIds.includes(d.id)).map((d) => ({ d, s: byDept[d.id] || { people: 0, ...empty() } }));
+    const rateClass = (a, b) => (b && a / b < 0.8 ? 'rate-low' : '');
+    const CELL = {
+      reviewed: ['cell-ok', '✔', '已查閱'], pending: ['cell-warn', '●', '已提交、待查閱'], missing: ['cell-bad', '✕', '未繳交'],
+      ongoing: ['cell-muted', '…', '本週進行中（不列入統計）'], na: ['cell-na', '', '尚未建立帳號（不列入統計）'],
+    };
+    const cellHtml = (c, w) => {
+      const [cls, sym, title] = CELL[c.state];
+      const t = c.r && !c.onTime ? title + '（逾期提交）' : title;
+      return c.r
+        ? `<a class="cell ${cls} ${c.onTime ? '' : 'late'}" href="#/reports/${c.r.id}${qs({ back: here() })}" title="${esc(weekLabel(w) + '：' + t)}">${sym}</a>`
+        : `<span class="cell ${cls}" title="${esc(weekLabel(w) + '：' + t)}">${sym}</span>`;
+    };
+    const opt = (v, label, cur) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
+    const md = (w) => w.slice(5).replace('-', '/');
+
+    layout(`
+      <div class="page-head">
+        <div>
+          <h1>繳交統計</h1>
+          <div class="muted">統計期間：${from.replace(/-/g, '/')} ～ ${addDays(to, 6).replace(/-/g, '/')}（共 ${n} 週）・${esc(deptFilter ? deptName[deptFilter] : '全部部門')}</div>
+        </div>
+        ${printButton()}
+      </div>
+      ${!departments.length ? '<div class="alert alert-warning">您目前沒有被指派任何可查閱的部門，請洽系統管理員設定。</div>' : ''}
+      <form class="card filters" data-filters>
+        <div class="week-nav">
+          <label class="inline-label">統計到<input type="date" name="to" value="${to}"></label>
+          <select name="weeks">${[4, 8, 12, 26].map((k) => opt(k, `近 ${k} 週`, n)).join('')}</select>
+          <a class="btn btn-sm ${to === thisWeek ? 'btn-primary' : ''}" href="#${here({ to: thisWeek })}">到本週</a>
+        </div>
+        <select name="dept">${opt('', '全部部門', deptFilter || '')}${departments.map((d) => opt(d.id, esc(d.name), deptFilter)).join('')}</select>
+      </form>
+
+      <div class="stats">
+        <div class="stat"><span>${total.due}</span>應繳份數</div>
+        <div class="stat stat-ok"><span>${pct(total.submitted, total.due)}</span>繳交率（${total.submitted} 份）</div>
+        <div class="stat stat-bad"><span>${total.due - total.submitted}</span>未繳份數</div>
+        <div class="stat"><span>${pct(total.onTime, total.submitted)}</span>準時率</div>
+      </div>
+
+      <h2 class="section-title">各部門</h2>
+      <section class="card"><div class="table-wrap"><table class="stats-table">
+        <thead><tr><th>部門</th><th class="num">人數</th><th class="num">應繳</th><th class="num">已繳</th><th class="num">未繳</th><th class="num">繳交率</th><th class="num">準時率</th><th class="num">已查閱</th><th class="num">查閱率</th></tr></thead>
+        <tbody>${deptRows.map(({ d, s }) => `<tr>
+          <td><a href="#${here({ dept: d.id })}">${esc(d.name)}</a></td>
+          <td class="num">${s.people}</td><td class="num">${s.due}</td><td class="num">${s.submitted}</td>
+          <td class="num ${s.due - s.submitted ? 'rate-low' : ''}">${s.due - s.submitted}</td>
+          <td class="num ${rateClass(s.submitted, s.due)}"><strong>${pct(s.submitted, s.due)}</strong></td>
+          <td class="num">${pct(s.onTime, s.submitted)}</td><td class="num">${s.reviewed}</td><td class="num">${pct(s.reviewed, s.submitted)}</td>
+        </tr>`).join('')}</tbody>
+        ${deptRows.length > 1 ? `<tfoot><tr><th>合計</th><th class="num">${rows.length}</th><th class="num">${total.due}</th><th class="num">${total.submitted}</th>
+          <th class="num">${total.due - total.submitted}</th><th class="num">${pct(total.submitted, total.due)}</th><th class="num">${pct(total.onTime, total.submitted)}</th>
+          <th class="num">${total.reviewed}</th><th class="num">${pct(total.reviewed, total.submitted)}</th></tr></tfoot>` : ''}
+      </table></div></section>
+
+      <h2 class="section-title">人員逐週繳交情況</h2>
+      <p class="legend small muted">
+        <span class="cell cell-ok">✔</span> 已查閱　<span class="cell cell-warn">●</span> 待查閱　<span class="cell cell-bad">✕</span> 未繳交　<span class="cell cell-ok late">✔</span> 逾期提交（底線）　<span class="cell cell-muted">…</span> 本週進行中　<span class="cell cell-na"></span> 尚未建立帳號<br>
+        「本週進行中」與「尚未建立帳號」的週次不列入統計；「準時」指在該週週日（含）以前提交。點選格子可開啟該份週報。
+      </p>
+      <section class="card">${!rows.length ? '<p class="muted center">沒有可統計的人員。</p>' : `<div class="table-wrap"><table class="stats-table grid">
+        <thead><tr><th>部門</th><th>姓名</th>${weeks.map((w) => `<th class="wk ${w === thisWeek ? 'this-week' : ''}" title="${esc(weekLabel(w))}">${md(w)}</th>`).join('')}
+          <th class="num">已繳／應繳</th><th class="num">繳交率</th><th class="num">準時</th></tr></thead>
+        <tbody>${rows.map(({ p, cells, sum }) => `<tr>
+          <td class="nowrap">${esc(deptName[p.department_id] || '—')}</td>
+          <td class="nowrap">${esc(p.name)}${p.role === 'manager' ? ' <span class="tag">主管</span>' : ''}</td>
+          ${cells.map((c, i) => `<td class="wk ${weeks[i] === thisWeek ? 'this-week' : ''}">${cellHtml(c, weeks[i])}</td>`).join('')}
+          <td class="num">${sum.submitted}／${sum.due}</td>
+          <td class="num ${rateClass(sum.submitted, sum.due)}"><strong>${pct(sum.submitted, sum.due)}</strong></td>
+          <td class="num">${sum.onTime}</td>
+        </tr>`).join('')}</tbody>
+        <tfoot><tr><th colspan="2">各週繳交</th>${byWeek.map((s) => `<th class="wk small">${s.due ? `${s.submitted}/${s.due}` : '—'}</th>`).join('')}
+          <th class="num">${total.submitted}／${total.due}</th><th class="num">${pct(total.submitted, total.due)}</th><th class="num">${total.onTime}</th></tr></tfoot>
+      </table></div>`}</section>`, 'stats');
+
+    const filters = root.querySelector('[data-filters]');
+    filters.addEventListener('change', () => {
+      const fd = new FormData(filters);
+      go('/stats' + qs({ to: weekStartOf(String(fd.get('to') || '')) || thisWeek, weeks: fd.get('weeks'), dept: fd.get('dept') }));
+    });
+    filters.addEventListener('submit', (e) => e.preventDefault());
   }
 
   /* ------------------------------------------------------------------ 管理：部門 */
@@ -740,6 +975,8 @@
     [/^\/reports\/(\d+)\/edit$/, (m, q) => pageReportForm(Number(m[1]), q)],
     [/^\/reports\/(\d+)$/, (m, q) => pageReportView(Number(m[1]), q)],
     [/^\/review$/, (m, q) => pageReview(q)],
+    [/^\/print$/, (m, q) => pagePrint(q)],
+    [/^\/stats$/, (m, q) => pageStats(q)],
     [/^\/admin\/departments$/, pageDepartments],
     [/^\/admin\/users$/, (m, q) => pageUsers(q)],
     [/^\/admin\/users\/new$/, () => pageUserForm(null)],

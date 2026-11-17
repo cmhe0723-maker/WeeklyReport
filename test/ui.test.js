@@ -39,10 +39,10 @@ const U = {
 const db = {
   departments: [{ id: 1, name: '北區業務部' }, { id: 2, name: '南區業務部' }],
   profiles: [
-    { id: U.admin, username: 'admin', name: '系統管理員', role: 'admin', department_id: null, active: true, must_change_password: false },
-    { id: U.boss, username: 'boss', name: '王經理', role: 'manager', department_id: 1, active: true, must_change_password: false },
-    { id: U.amy, username: 'amy', name: '陳小明', role: 'staff', department_id: 1, active: true, must_change_password: false },
-    { id: U.bob, username: 'bob', name: '黃大偉', role: 'staff', department_id: 2, active: true, must_change_password: true },
+    { id: U.admin, username: 'admin', name: '系統管理員', role: 'admin', department_id: null, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.boss, username: 'boss', name: '王經理', role: 'manager', department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.amy, username: 'amy', name: '陳小明', role: 'staff', department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.bob, username: 'bob', name: '黃大偉', role: 'staff', department_id: 2, active: true, must_change_password: true, created_at: new Date().toISOString() },
   ],
   manager_departments: [{ user_id: U.boss, department_id: 1 }],
   reports: [
@@ -84,12 +84,15 @@ function applyQuery(rows, params) {
   let out = rows;
   for (const [k, v] of params) {
     if (['select', 'order', 'limit', 'offset'].includes(k)) continue;
+    if (k === 'and' || k === 'or') throw new Error('mock 不支援的條件：' + k);
     const get = (r) => k.split('.').reduce((o, p) => (o == null ? o : o[p]), r);
     const vals = (s) => s.replace(/^\(|\)$/g, '').split(',').map((x) => x.replace(/^"|"$/g, ''));
     let f;
     if (v.startsWith('eq.')) f = (r) => String(get(r)) === v.slice(3);
     else if (v.startsWith('neq.')) f = (r) => String(get(r)) !== v.slice(4);
     else if (v.startsWith('lt.')) f = (r) => String(get(r)) < v.slice(3);
+    else if (v.startsWith('gte.')) f = (r) => String(get(r)) >= v.slice(4);
+    else if (v.startsWith('lte.')) f = (r) => String(get(r)) <= v.slice(4);
     else if (v.startsWith('in.')) f = (r) => vals(v.slice(3)).includes(String(get(r)));
     else if (v === 'is.null') f = (r) => get(r) == null;
     else if (v === 'not.is.null') f = (r) => get(r) != null;
@@ -101,6 +104,7 @@ function applyQuery(rows, params) {
     const [col, dir] = order.split('.');
     out = [...out].sort((a, b) => (String(a[col]) < String(b[col]) ? -1 : String(a[col]) > String(b[col]) ? 1 : 0) * (dir === 'desc' ? -1 : 1));
   }
+  if (params.get('offset')) out = out.slice(Number(params.get('offset')));
   if (params.get('limit')) out = out.slice(0, Number(params.get('limit')));
   return out;
 }
@@ -318,6 +322,99 @@ test('首次登入強制變更密碼', async () => {
   await page.click('form[data-form] button');
   await page.waitForSelector('.highlight');
   assert.match(page.url(), /#\/reports$/);
+  await page.context().close();
+});
+
+test('繳交統計：管理員看全部部門、數字正確', async () => {
+  const page = await login('admin');
+  await page.waitForSelector('.stats');
+  await page.click('a[href="#/stats"]');
+  await page.waitForSelector('h1:has-text("繳交統計")');
+  assert.match(await page.textContent('.page-head .muted'), /共 8 週/); // 預設近 8 週
+  await page.goto(base + '#/stats?weeks=4');
+  await page.waitForSelector('.page-head .muted:has-text("共 4 週")');
+  // 近 4 週：陳小明 前兩週未繳、上週已查閱（逾期提交）、本週待查閱 → 2/4；
+  // 王經理 前三週未繳、本週進行中 → 0/3；黃大偉 本週才建立 → 0/0
+  const deptRows = await page.$$eval('.stats-table:not(.grid) tbody tr', (trs) => trs.map((tr) => [...tr.cells].map((td) => td.textContent.trim())));
+  assert.deepStrictEqual(deptRows, [
+    ['北區業務部', '2', '7', '2', '5', '29%', '50%', '1', '50%'],
+    ['南區業務部', '1', '0', '0', '0', '—', '—', '0', '—'],
+  ]);
+  const people = await page.$$eval('.stats-table.grid tbody tr', (trs) => trs.map((tr) => {
+    const c = [...tr.cells];
+    return [c[1].textContent.trim(), c.slice(2, 6).map((td) => (td.querySelector('.cell') || {}).className.replace('cell ', '').trim()), c[6].textContent.trim(), c[7].textContent.trim()];
+  }));
+  assert.deepStrictEqual(people, [
+    ['陳小明', ['cell-bad', 'cell-bad', 'cell-ok late', 'cell-warn'], '2／4', '50%'],
+    ['王經理 主管', ['cell-bad', 'cell-bad', 'cell-bad', 'cell-muted'], '0／3', '0%'],
+    ['黃大偉', ['cell-na', 'cell-na', 'cell-na', 'cell-muted'], '0／0', '—'],
+  ]);
+  assert.match(await page.textContent('.stats'), /應繳份數[\s\S]*29%[\s\S]*未繳份數/);
+  // 點格子開啟週報，並能返回統計
+  await page.click('.stats-table.grid a.cell-ok');
+  await page.waitForSelector('.report-body');
+  assert.match(await page.getAttribute('a.small.no-print', 'href'), /^#\/stats/);
+  // 列印版面（橫向）可輸出 PDF
+  await page.goto(base + '#/stats?weeks=4');
+  await page.waitForSelector('.stats-table.grid');
+  await page.emulateMedia({ media: 'print' });
+  assert.strictEqual(await page.isVisible('.topbar'), false);
+  assert.strictEqual(await page.isVisible('form[data-filters]'), false);
+  const pdf = await page.pdf({ path: path.join(process.env.SHOT_DIR || '/tmp', 'sample-stats.pdf'), preferCSSPageSize: true, printBackground: true });
+  assert.strictEqual(pdf.subarray(0, 4).toString(), '%PDF');
+  await page.context().close();
+});
+
+test('繳交統計：主管只看到自己負責的部門；業務人員不能進入', async () => {
+  const page = await login('boss');
+  await page.waitForSelector('.stats');
+  await page.goto(base + '#/stats?weeks=4');
+  await page.waitForSelector('.stats-table.grid');
+  const text = await page.textContent('main');
+  assert.match(text, /陳小明/);
+  assert.doesNotMatch(text, /黃大偉|南區業務部/);
+  assert.strictEqual(await page.$$eval('select[name=dept] option', (o) => o.length), 2); // 全部部門 + 北區
+  await page.context().close();
+
+  const staff = await login('amy');
+  await staff.waitForSelector('.highlight');
+  assert.strictEqual(await staff.$('a[href="#/stats"]'), null);
+  await staff.goto(base + '#/stats');
+  await staff.waitForSelector('h1');
+  assert.match(await staff.textContent('h1'), /權限不足/);
+  await staff.context().close();
+});
+
+test('列印：單份週報與整週批次列印、輸出 PDF', async () => {
+  const page = await login('boss');
+  await page.waitForSelector('.stats');
+  await page.goto(base + '#/reports/1');
+  await page.waitForSelector('[data-print]');
+  // 按鈕會呼叫瀏覽器列印
+  await page.evaluate(() => { window.__printed = 0; window.print = () => { window.__printed += 1; }; });
+  await page.click('[data-print]');
+  assert.strictEqual(await page.evaluate(() => window.__printed), 1);
+  // 列印版面：隱藏選單與操作，顯示列印資訊
+  await page.emulateMedia({ media: 'print' });
+  assert.strictEqual(await page.isVisible('.topbar'), false);
+  assert.strictEqual(await page.isVisible('[data-print]'), false);
+  assert.strictEqual(await page.isVisible('.print-meta'), true);
+  assert.match(await page.textContent('.print-meta'), /工作週報系統[\s\S]*列印人：王經理/);
+  assert.strictEqual(await page.isVisible('.daily-view'), true);
+  assert.strictEqual(await page.isVisible('.review-box'), true);
+  const pdf1 = await page.pdf({ path: path.join(process.env.SHOT_DIR || '/tmp', 'sample-report.pdf'), preferCSSPageSize: true, printBackground: true });
+  assert.strictEqual(pdf1.subarray(0, 4).toString(), '%PDF');
+  await page.emulateMedia({ media: 'screen' });
+
+  // 週報查閱 → 列印上週週報
+  await page.goto(base + `#/review?week=${LAST_WEEK}`);
+  await page.waitForSelector('.section-title-row');
+  await page.click('a[href^="#/print"]');
+  await page.waitForSelector('h1:has-text("列印週報")');
+  assert.strictEqual(await page.$$eval('.print-report', (a) => a.length), 1);
+  assert.match(await page.textContent('.print-report'), /陳小明 的週報[\s\S]*拜訪大成科技[\s\S]*已查閱完成/);
+  const pdf2 = await page.pdf({ path: path.join(process.env.SHOT_DIR || '/tmp', 'sample-batch.pdf'), preferCSSPageSize: true, printBackground: true });
+  assert.strictEqual(pdf2.subarray(0, 4).toString(), '%PDF');
   await page.context().close();
 });
 
