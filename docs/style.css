@@ -155,3 +155,61 @@ details.weekend .day-field + .day-field { margin-top: .75rem; }
   .day-row { grid-template-columns: 1fr; gap: .2rem; }
   .day-name { padding-top: 0; }
 }
+
+/* 提示訊息 */
+.alert-info { background: #eff6ff; color: #1e3a8a; border-color: #bfdbfe; }
+.stat-bad span { color: var(--danger); }
+.section-title-row { margin: 1.25rem 0 .75rem; }
+.section-title-row .section-title { margin: 0; }
+.inline-label { flex-direction: row; align-items: center; gap: .4rem; font-weight: 400; }
+
+/* 繳交統計 */
+.stats-table .num { text-align: right; white-space: nowrap; }
+.stats-table tfoot th { background: #fafbfc; color: var(--text); border-top: 2px solid var(--line); }
+.stats-table .rate-low { color: var(--danger); }
+.stats-table.grid th.wk, .stats-table.grid td.wk { text-align: center; padding-left: .25rem; padding-right: .25rem; min-width: 2.6rem; }
+.stats-table .this-week { background: #f5f9ff; }
+.cell { display: inline-flex; align-items: center; justify-content: center; width: 1.6rem; height: 1.6rem; border-radius: 5px; font-size: .85rem; font-weight: 700; vertical-align: middle; }
+a.cell:hover { text-decoration: none; outline: 2px solid var(--primary); }
+.cell-ok { background: var(--ok-bg); color: var(--ok); }
+.cell-warn { background: var(--warn-bg); color: var(--warn); }
+.cell-bad { background: var(--danger-bg); color: var(--danger); }
+.cell-muted { background: var(--muted-bg); color: var(--muted); }
+.cell-na { background: repeating-linear-gradient(45deg, #f3f4f6, #f3f4f6 3px, #fff 3px, #fff 6px); }
+.cell.late { text-decoration: underline; text-underline-offset: 2px; }
+.legend { line-height: 2; margin: -.25rem 0 .75rem; }
+.legend .cell { width: 1.3rem; height: 1.3rem; font-size: .75rem; }
+
+/* 列印多份週報 */
+.print-report-head h2 { margin: 0 0 .2rem; font-size: 1.2rem; display: flex; align-items: center; gap: .5rem; }
+.print-report-head { margin-bottom: .75rem; padding-bottom: .5rem; border-bottom: 1px solid var(--line); }
+.print-review { margin-top: 1rem; border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem; }
+
+/* ===== 列印／輸出 PDF ===== */
+.print-only { display: none; }
+@page { size: A4; margin: 14mm 12mm; }
+@page landscape { size: A4 landscape; margin: 12mm 10mm; }
+@media print {
+  html, body { background: #fff; font-size: 10.5pt; }
+  .topbar, .no-print, .alert, .actions, form[data-review], form[data-filters], .review-log, button, .btn { display: none !important; }
+  .print-only { display: block !important; }
+  .print-meta { font-size: 8.5pt; color: #555; text-align: right; margin-bottom: 6pt; }
+  .container { max-width: none; padding: 0; }
+  .card { border: 0; border-radius: 0; padding: 0; margin: 0 0 10pt; background: none; }
+  .page-head { margin-bottom: 8pt; }
+  .grid-2 { display: block; }
+  .review-box { border: 1px solid #bbb !important; border-radius: 6px; padding: 6pt 9pt !important; margin-top: 8pt; background: none !important; }
+  .report-body .pre { background: none; border: 1px solid #ccc; padding: 4pt 7pt; }
+  .day-row { grid-template-columns: 5.5rem minmax(0, 1fr); }
+  .day-row, .pre, tr, .review-box { break-inside: avoid; }
+  h3 { break-after: avoid; }
+  .print-report { break-after: page; }
+  .print-report:last-child { break-after: auto; }
+  a { color: inherit; text-decoration: none; }
+  .table-wrap { overflow: visible; margin: 0; padding: 0; }
+  th, td { padding: 3pt 4pt; }
+  .page-stats { page: landscape; }
+  .stats { grid-template-columns: repeat(4, 1fr); gap: 6pt; }
+  .stat { padding: 4pt 8pt; }
+  .badge, .cell, .stat, .tag, th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
