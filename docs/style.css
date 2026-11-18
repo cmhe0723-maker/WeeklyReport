@@ -373,3 +373,42 @@ mark { background: #fbe8b4; color: inherit; padding: 0 1px; border-radius: 2px; 
   .cust-stats .stat-people { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--rule-soft); }
 }
 @media print { .customer-panel, .cust-search, .suggest { display: none !important; } }
+
+/* ===== 每日多筆拜訪 ===== */
+.day-block { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 1rem; align-items: start; padding: .7rem 0; border-bottom: 1px solid var(--rule-soft); }
+.day-head { font-weight: 600; font-size: .92rem; padding-top: .45rem; }
+.day-body { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; }
+.entries { display: flex; flex-direction: column; gap: .6rem; width: 100%; }
+.entry { border-left: 2px solid var(--rule); padding: .1rem 0 .1rem .8rem; }
+.entry:focus-within { border-left-color: var(--blue); }
+.entry-meta { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-bottom: .3rem; }
+.entry-field { flex-direction: row; align-items: center; gap: .4rem; font-size: .85rem; font-weight: 600; color: var(--ink-soft); flex: 1 1 11rem; white-space: nowrap; min-width: 0; }
+.entry-field input { padding: .3rem .55rem; font-size: .92rem; min-width: 0; flex: 1; }
+.entry-remove { border: 0; background: none; color: var(--ink-soft); cursor: pointer; font-size: .95rem; padding: .2rem .4rem; border-radius: var(--radius-s); }
+.entry-remove:hover { color: var(--danger); background: var(--danger-bg); }
+.entry textarea {
+  min-height: calc(1.7em * 2 + .9rem); border-color: transparent; border-radius: 0; padding: .45rem .2rem;
+  background-image: linear-gradient(to bottom, transparent calc(1.7em - 1px), var(--rule-soft) calc(1.7em - 1px));
+  background-size: 100% 1.7em; background-repeat: repeat-y; background-attachment: local;
+  background-origin: content-box; background-clip: content-box;
+}
+.entry textarea:hover { border-color: var(--rule-soft); }
+.entry textarea:focus { border-color: var(--blue); background-color: #fbfcff; }
+.btn-add-entry { color: var(--blue); border-style: dashed; }
+details.weekend .day-block:last-child { border-bottom: 0; }
+/* 檢視 */
+.day-entries { display: flex; flex-direction: column; }
+.entry-view { padding: .35rem 0 .45rem; }
+.entry-view + .entry-view { border-top: 1px dashed var(--rule-soft); }
+.entry-view .pre { padding: 0; border: 0; }
+.report-body .entry-view .pre { padding: 0; border-bottom: 0; }
+.entry-who { display: flex; flex-wrap: wrap; gap: .2rem .9rem; align-items: baseline; margin-bottom: .1rem; }
+.entry-contact-name { color: var(--ink-soft); font-size: .88rem; }
+@media (max-width: 560px) {
+  .day-block { grid-template-columns: 1fr; gap: .3rem; }
+  .day-head { padding-top: 0; }
+  .entry-field { flex-basis: 100%; }
+}
+@media print {
+  .entry-view { break-inside: avoid; }
+}

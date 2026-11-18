@@ -57,8 +57,8 @@ const db = {
   ],
   review_logs: [],
   customers: [
-    { id: 1, department_id: 1, name: '大成科技', aliases: ['大成'], active: true },
-    { id: 2, department_id: 2, name: '南方企業', aliases: [], active: true },
+    { id: 1, department_id: 1, name: '大成科技', aliases: ['大成'], contacts: ['林課長'], active: true },
+    { id: 2, department_id: 2, name: '南方企業', aliases: [], contacts: [], active: true },
   ],
 };
 const rpcCalls = [];
@@ -143,13 +143,17 @@ function rpc(fn, args, uid) {
   const now = new Date().toISOString();
   switch (fn) {
     case 'save_report': {
+      if (args.p_daily_entries) {
+        args.p_daily_work = args.p_daily_entries.map((d) => d.map((e) => (!e.customer && !e.contact ? e.content
+          : `${e.customer}${e.contact ? `（${e.contact}）` : ''}${e.content ? `：${e.content}` : ''}`)).join('\n'));
+      }
       if (args.p_id) {
         const r = db.reports.find((x) => x.id === args.p_id);
-        Object.assign(r, { work_summary: args.p_work_summary, daily_work: args.p_daily_work, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? (r.submitted_at || now) : null, updated_at: now });
+        Object.assign(r, { work_summary: args.p_work_summary, daily_work: args.p_daily_work, daily_entries: args.p_daily_entries || [], status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? (r.submitted_at || now) : null, updated_at: now });
         return r.id;
       }
       const id = Math.max(...db.reports.map((x) => x.id)) + 1;
-      db.reports.push({ id, user_id: uid, week_start: args.p_week, work_summary: args.p_work_summary, daily_work: args.p_daily_work, customer_visits: args.p_customer_visits, sales_progress: args.p_sales_progress, next_week_plan: args.p_next_week_plan, issues: args.p_issues, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? now : null, updated_at: now, reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
+      db.reports.push({ id, user_id: uid, week_start: args.p_week, work_summary: args.p_work_summary, daily_work: args.p_daily_work, daily_entries: args.p_daily_entries || [], customer_visits: args.p_customer_visits, sales_progress: args.p_sales_progress, next_week_plan: args.p_next_week_plan, issues: args.p_issues, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? now : null, updated_at: now, reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
       return id;
     }
     case 'review_report': {
@@ -170,11 +174,11 @@ function rpc(fn, args, uid) {
         && [c.name, ...c.aliases].some((t) => terms.includes(t.toLowerCase())));
       if (clash) throw new RpcError(`「${terms.find((t) => [clash.name, ...clash.aliases].map((x) => x.toLowerCase()).includes(t))}」已經是客戶「${clash.name}」的名稱或別名。`);
       if (args.p_id) {
-        Object.assign(db.customers.find((c) => c.id === args.p_id), { name, aliases: args.p_aliases, active: args.p_active, department_id: args.p_department_id });
+        Object.assign(db.customers.find((c) => c.id === args.p_id), { name, aliases: args.p_aliases, active: args.p_active, department_id: args.p_department_id, ...(args.p_contacts ? { contacts: args.p_contacts } : {}) });
         return args.p_id;
       }
       const id = Math.max(...db.customers.map((c) => c.id)) + 1;
-      db.customers.push({ id, department_id: args.p_department_id, name, aliases: args.p_aliases, active: true });
+      db.customers.push({ id, department_id: args.p_department_id, name, aliases: args.p_aliases, contacts: args.p_contacts || [], active: true });
       return id;
     }
     case 'admin_delete_customer':
@@ -366,31 +370,46 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   assert.strictEqual(await page.$('a[href="#/review"]'), null, '業務不應看到查閱選單');
 
   await page.click(`a[href="#/reports/new?week=${THIS_WEEK}"]`);
-  await page.waitForSelector('textarea[name=day0]');
+  await page.waitForSelector('.day-block[data-day="0"] textarea[name=content]');
   // 週一～週五直接顯示、週末收合；欄位標示日期
   assert.match(await page.textContent('[data-day-label="0"]'), new RegExp('週一 ' + THIS_WEEK.slice(5).replace('-', '/')));
-  assert.strictEqual(await page.isVisible('textarea[name=day4]'), true);
-  assert.strictEqual(await page.isVisible('textarea[name=day6]'), false);
+  assert.strictEqual(await page.isVisible('.day-block[data-day="4"] textarea[name=content]'), true);
+  assert.strictEqual(await page.isVisible('.day-block[data-day="6"] textarea[name=content]'), false);
   assert.strictEqual(await page.$('textarea[name=work_summary]'), null, '新週報不顯示舊版欄位');
   assert.match(await page.textContent('.prev-plan'), /追蹤簽約/);
   await page.click('button[value=submit]');
   await page.waitForSelector('[data-error] .alert-error'); // 未填內容
-  await page.fill('textarea[name=day0]', '拜訪三家客戶');
-  await page.fill('textarea[name=day2]', '準備報價');
+  const D0 = '.day-block[data-day="0"]';
+  await page.fill(`${D0} textarea[name=content]`, '拜訪三家客戶');
+  // 同一天新增第二筆：客戶＋聯絡人
+  await page.click(`${D0} [data-add-entry]`);
+  assert.strictEqual(await page.$$eval(`${D0} .entry`, (e) => e.length), 2);
+  await page.fill(`${D0} .entry:nth-child(2) [name=customer]`, '星辰企業');
+  await page.fill(`${D0} .entry:nth-child(2) [name=contact]`, '王經理');
+  await page.fill(`${D0} .entry:nth-child(2) textarea[name=content]`, '說明新方案');
+  // 新增後刪除的一筆不會送出
+  await page.click(`${D0} [data-add-entry]`);
+  await page.fill(`${D0} .entry:nth-child(3) textarea[name=content]`, '要刪掉的');
+  await page.click(`${D0} .entry:nth-child(3) [data-remove-entry]`);
+  assert.strictEqual(await page.$$eval(`${D0} .entry`, (e) => e.length), 2);
+  await page.fill('.day-block[data-day="2"] textarea[name=content]', '準備報價');
   await page.click('details.weekend summary');
-  await page.fill('textarea[name=day6]', '週日拜訪');
+  await page.fill('.day-block[data-day="6"] textarea[name=content]', '週日拜訪');
   await shot(page, 'ui-daily-form');
   await page.click('button[value=submit]');
   await page.waitForSelector('.report-body');
   const call = rpcCalls.at(-1);
   assert.strictEqual(call.fn, 'save_report');
-  assert.deepStrictEqual({ p_id: call.args.p_id, p_week: call.args.p_week, p_submit: call.args.p_submit, p_work_summary: call.args.p_work_summary, p_daily_work: call.args.p_daily_work },
-    { p_id: null, p_week: THIS_WEEK, p_submit: true, p_work_summary: '', p_daily_work: ['拜訪三家客戶', '', '準備報價', '', '', '', '週日拜訪'] });
+  const only = (content) => [{ customer: '', contact: '', content }];
+  assert.deepStrictEqual({ p_id: call.args.p_id, p_week: call.args.p_week, p_submit: call.args.p_submit, p_work_summary: call.args.p_work_summary, p_daily_entries: call.args.p_daily_entries },
+    { p_id: null, p_week: THIS_WEEK, p_submit: true, p_work_summary: '',
+      p_daily_entries: [[...only('拜訪三家客戶'), { customer: '星辰企業', contact: '王經理', content: '說明新方案' }], [], only('準備報價'), [], [], [], only('週日拜訪')] });
   // 檢視頁：平日都列出、週末只列出有內容的那天
   const view = await page.textContent('.daily-view');
-  assert.match(view, /週一[\s\S]*拜訪三家客戶[\s\S]*週二[\s\S]*未填寫[\s\S]*週三[\s\S]*準備報價/);
+  assert.match(view, /週一[\s\S]*拜訪三家客戶[\s\S]*星辰企業[\s\S]*聯絡人：王經理[\s\S]*說明新方案[\s\S]*週二[\s\S]*未填寫[\s\S]*週三[\s\S]*準備報價/);
   assert.match(view, /週日[\s\S]*週日拜訪/);
   assert.doesNotMatch(view, /週六/);
+  await shot(page, 'd-entries-view');
   assert.match(await page.textContent('main'), /待查閱/);
 
   await page.goto(base + '#/admin/users');
@@ -517,7 +536,7 @@ test('客戶：填寫週報時的輸入建議、過往紀錄與新增客戶', as
   assert.match(await page.textContent('[data-cust-list]'), /寫到名錄中的客戶時/);
 
   // 輸入別名「大成」→ 建議「大成科技」（不會出現別部門的「南方企業」）→ Enter 補成正式名稱
-  await page.click('textarea[name=day1]');
+  await page.click('.day-block[data-day="1"] textarea[name=content]');
   await page.keyboard.type('下午去大成');
   await page.waitForSelector('.suggest:not([hidden]) .suggest-item');
   const items = await page.$$eval('.suggest:not([hidden]) .suggest-item', (els) => els.map((e) => e.textContent.replace(/\s+/g, ' ').trim()));
@@ -525,7 +544,15 @@ test('客戶：填寫週報時的輸入建議、過往紀錄與新增客戶', as
   assert.match(items.at(-1), /新增「大成」到客戶名錄/);
   assert.ok(!items.some((t) => t.includes('南方企業')));
   await page.keyboard.press('Enter');
-  assert.strictEqual(await page.inputValue('textarea[name=day1]'), '下午去大成科技');
+  assert.strictEqual(await page.inputValue('.day-block[data-day="1"] textarea[name=content]'), '下午去大成科技');
+  // 客戶欄：名錄建議；填了客戶（別名也可）後，聯絡人欄建議這家客戶的聯絡人
+  const D0 = '.day-block[data-day="0"]';
+  assert.deepStrictEqual(await page.$$eval('#dl-customers option', (o) => o.map((x) => x.value)), ['大成科技']);
+  await page.fill(`${D0} [name=customer]`, '大成');
+  assert.deepStrictEqual(await page.$$eval(`${D0} datalist[id^=dl-contacts] option`, (o) => o.map((x) => x.value)), ['林課長']);
+  await page.fill(`${D0} [name=customer]`, '不在名錄的公司');
+  assert.deepStrictEqual(await page.$$eval(`${D0} datalist[id^=dl-contacts] option`, (o) => o.length), 0);
+  await page.fill(`${D0} [name=customer]`, '');
   assert.strictEqual(await page.isVisible('.suggest'), false);
 
   // 面板列出提到的客戶，點選顯示過往紀錄（上週週報，客戶名稱標示）
@@ -546,7 +573,7 @@ test('客戶：填寫週報時的輸入建議、過往紀錄與新增客戶', as
   await page.fill('dialog input[name=aliases]', '長興、 長興');
   await page.click('dialog button.btn-primary');
   await page.waitForSelector('.chip:has-text("長興企業")');
-  assert.deepStrictEqual(rpcCalls.at(-1).args, { p_id: null, p_department_id: 1, p_name: '長興企業', p_aliases: ['長興', '長興'], p_active: true });
+  assert.deepStrictEqual(rpcCalls.at(-1).args, { p_id: null, p_department_id: 1, p_name: '長興企業', p_aliases: ['長興', '長興'], p_active: true, p_contacts: [] });
 
   // 名稱或別名重複：顯示資料庫回傳的說明（瀏覽器會記錄這一次預期中的 400 錯誤）
   const before = errors.length;
@@ -589,7 +616,8 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   await page.fill('dialog input[name=aliases]', '大成、DC電子');
   await page.click('dialog button.btn-primary');
   await page.waitForSelector('.alert-success');
-  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'save_customer').at(-1).args, { p_id: 1, p_department_id: 1, p_name: '大成科技', p_aliases: ['大成', 'DC電子'], p_active: true });
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'save_customer').at(-1).args, { p_id: 1, p_department_id: 1, p_name: '大成科技', p_aliases: ['大成', 'DC電子'], p_active: true, p_contacts: ['林課長'] });
+  assert.match(await page.textContent('.page-head'), /聯絡人：林課長/);
   assert.match(await page.textContent('.page-head .muted'), /別名：大成、DC電子/);
 
   // 開啟週報後可返回客戶頁

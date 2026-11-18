@@ -79,6 +79,16 @@
     const a = r && Array.isArray(r.daily_work) ? r.daily_work : [];
     return DAY_NAMES.map((_, i) => String(a[i] || ''));
   }
+  // 每日多筆拜訪 → 長度 7 的陣列，每天是 [{ customer, contact, content }]；舊週報由每日文字轉成一筆
+  function dailyEntriesOf(r) {
+    const e = r && Array.isArray(r.daily_entries) ? r.daily_entries : [];
+    const text = dailyOf(r);
+    return DAY_NAMES.map((_, i) => {
+      const list = Array.isArray(e[i]) ? e[i].filter((x) => x && (x.customer || x.contact || x.content)) : [];
+      if (list.length) return list.map((x) => ({ customer: x.customer || '', contact: x.contact || '', content: x.content || '' }));
+      return text[i] ? [{ customer: '', contact: '', content: text[i] }] : [];
+    });
+  }
   function dayLabel(ws, i) {
     return `週${DAY_NAMES[i]} ${addDays(ws, i).slice(5).replace('-', '/')}`;
   }
@@ -135,9 +145,11 @@
         <div><dt>最後更新</dt><dd>${fmtDateTime(report.updated_at)}</dd></div>
       </dl>
       <h3>每日工作內容</h3>
-      <div class="daily-view">${dailyOf(report).map((t, i) => (i < 5 || t ? `<div class="day-row">
+      <div class="daily-view">${dailyEntriesOf(report).map((list, i) => (i < 5 || list.length ? `<div class="day-row">
         <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
-        <div class="pre ${t ? '' : 'muted'}">${esc(t || '（未填寫）')}</div></div>` : '')).join('')}</div>
+        <div class="day-entries">${list.length ? list.map((e) => `<div class="entry-view">
+          ${e.customer || e.contact ? `<div class="entry-who">${e.customer ? `<strong>${esc(e.customer)}</strong>` : ''}${e.contact ? `<span class="entry-contact-name">聯絡人：${esc(e.contact)}</span>` : ''}</div>` : ''}
+          ${e.content ? `<div class="pre">${esc(e.content)}</div>` : ''}</div>`).join('') : '<div class="pre muted">（未填寫）</div>'}</div></div>` : '')).join('')}</div>
       ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
       ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}`;
   }
@@ -161,9 +173,14 @@
   /* ---------- 客戶名錄共用 ---------- */
   const FIELD_LABELS = { daily: '每日工作內容', customer_visits: '客戶拜訪紀錄', work_summary: '本週工作內容' };
   async function loadCustomers() {
-    return must(await sb.from('customers').select('id, department_id, name, aliases, active').order('name'));
+    return must(await sb.from('customers').select('id, department_id, name, aliases, contacts, active').order('name'));
   }
   const termsOf = (c) => [c.name, ...(c.aliases || [])];
+  // 依客戶欄文字找名錄中的客戶（正式名稱或別名，不分大小寫）
+  const findCustomer = (text, list) => {
+    const t = String(text || '').trim().toLowerCase();
+    return t ? list.find((c) => termsOf(c).some((x) => x.toLowerCase() === t)) || null : null;
+  };
   // 文字中提到的客戶
   function mentionedIn(text, customers) {
     const t = text.toLowerCase();
@@ -211,6 +228,8 @@
           <label>客戶名稱（正式名稱）<input name="name" value="${esc(customer ? customer.name : name || '')}" maxlength="100" required autocomplete="off"></label>
           <label>別名或簡稱 <span class="hint">用「、」或逗號分隔，每個至少 2 個字</span>
             <input name="aliases" value="${esc(customer ? customer.aliases.join('、') : '')}" placeholder="例：大成、大成電子" autocomplete="off"></label>
+          <label>聯絡人 <span class="hint">用「、」或逗號分隔；填寫週報時也會自動加入</span>
+            <input name="contacts" value="${esc(customer ? (customer.contacts || []).join('、') : '')}" placeholder="例：王經理、李小姐" autocomplete="off"></label>
           ${editing ? `<label class="check-label"><input type="checkbox" name="active" value="1" ${customer.active ? 'checked' : ''}> 使用中（取消勾選即停用，不再出現在輸入建議）</label>` : ''}
           <div class="actions"><button type="button" class="btn" data-cancel>取消</button><button class="btn btn-primary" value="save">${editing ? '儲存' : '加入名錄'}</button></div>
         </form>`;
@@ -231,6 +250,7 @@
             p_name: String(fd.get('name') || '').trim(),
             p_aliases: parseAliases(fd.get('aliases')),
             p_active: editing ? fd.get('active') === '1' : true,
+            p_contacts: parseAliases(fd.get('contacts')),
           }));
           done(id);
         } catch (err) {
@@ -291,7 +311,7 @@
       }
       close();
     };
-    textareas.forEach((ta) => {
+    const bind = (ta) => {
       ta.setAttribute('aria-autocomplete', 'list');
       ta.addEventListener('input', (e) => { if (!e.isComposing) update(ta); });
       ta.addEventListener('compositionend', () => update(ta));
@@ -310,7 +330,8 @@
         }
       });
       ta.addEventListener('blur', () => setTimeout(() => { if (state && state.ta === ta && document.activeElement !== ta) close(); }, 150));
-    });
+    };
+    textareas.forEach(bind);
     box.addEventListener('mousedown', (e) => {
       const el = e.target.closest('[data-i]');
       if (!el) return;
@@ -318,6 +339,7 @@
       choose(state.items[Number(el.dataset.i)]);
     });
     window.addEventListener('hashchange', () => box.remove(), { once: true });
+    return bind;
   }
 
   // 查看週報後可返回的列表頁
@@ -561,9 +583,14 @@
       allDepts = ds;
     }
 
-    const days = dailyOf(report);
-    const dayField = (i) => `<label class="day-field"><span data-day-label="${i}">${dayLabelHtml(report.week_start, i)}</span>
-      <textarea name="day${i}" rows="3" maxlength="4000" placeholder="${i === 0 ? '例：拜訪 A 公司說明新方案；完成 B 案報價' : ''}">${esc(days[i])}</textarea></label>`;
+    const entries = dailyEntriesOf(report);
+    const dayBlock = (i) => `<div class="day-block" data-day="${i}">
+      <div class="day-head"><span data-day-label="${i}">${dayLabelHtml(report.week_start, i)}</span></div>
+      <div class="day-body">
+        <div class="entries">${(entries[i].length ? entries[i] : [{}]).map(entryHtml).join('')}</div>
+        <button type="button" class="btn btn-sm btn-add-entry" data-add-entry>＋ 新增一筆</button>
+      </div>
+    </div>`;
     const ta = (name, rows, ph) => `<textarea name="${name}" rows="${rows}" maxlength="10000" placeholder="${esc(ph || '')}">${esc(report[name] || '')}</textarea>`;
     layout(`
       <div class="page-head">
@@ -582,12 +609,13 @@
         </div>
         ${prev ? `<details class="prev-plan"><summary>參考：上次填寫的「下週工作計畫」（${weekLabel(prev.week_start)}）</summary><div class="pre">${esc(prev.next_week_plan)}</div></details>` : ''}
         <fieldset class="daily">
-          <legend>每日工作內容 <span class="req">*</span> <span class="hint">至少填寫一天</span></legend>
-          ${[0, 1, 2, 3, 4].map(dayField).join('')}
-          <details class="weekend" ${days[5] || days[6] ? 'open' : ''}>
+          <legend>每日工作內容 <span class="req">*</span> <span class="hint">至少填寫一天；每筆可填客戶與聯絡人</span></legend>
+          ${[0, 1, 2, 3, 4].map(dayBlock).join('')}
+          <details class="weekend" ${entries[5].length || entries[6].length ? 'open' : ''}>
             <summary>週六、週日（選填）</summary>
-            ${[5, 6].map(dayField).join('')}
+            ${[5, 6].map(dayBlock).join('')}
           </details>
+          <datalist id="dl-customers">${myCustomers.filter((c) => c.active).map((c) => `<option value="${esc(c.name)}">${esc(c.aliases.join('、'))}</option>`).join('')}</datalist>
         </fieldset>
         ${report.work_summary ? `<label>本週工作內容（舊版欄位）${ta('work_summary', 4)}</label>` : ''}
         <label>客戶拜訪紀錄${ta('customer_visits', 5, '客戶名稱／拜訪日期／洽談重點')}</label>
@@ -616,17 +644,53 @@
       form.querySelector('[data-week-label]').textContent = ws ? '本週報週次：' + weekLabel(ws) : '';
       if (ws) form.querySelectorAll('[data-day-label]').forEach((el) => { el.innerHTML = dayLabelHtml(ws, Number(el.dataset.dayLabel)); });
     });
-    if (me.department_id) bindCustomerPanel(form, report, allDepts, myCustomers);
+    // 新增一筆、刪除一筆；客戶欄改變時更新聯絡人建議
+    const hooks = { bindContent: () => {} };
+    const fillContacts = (entry) => {
+      const c = findCustomer(entry.querySelector('[name=customer]').value, myCustomers);
+      const dl = entry.querySelector('datalist');
+      dl.innerHTML = c ? (c.contacts || []).map((x) => `<option value="${esc(x)}"></option>`).join('') : '';
+    };
+    form.querySelectorAll('.entry').forEach(fillContacts);
+    form.addEventListener('click', (e) => {
+      const add = e.target.closest('[data-add-entry]');
+      if (add) {
+        const list = add.closest('.day-block').querySelector('.entries');
+        if (list.children.length >= 20) return window.alert('每天最多 20 筆。');
+        list.insertAdjacentHTML('beforeend', entryHtml({}));
+        const entry = list.lastElementChild;
+        hooks.bindContent(entry.querySelector('textarea'));
+        entry.querySelector('[name=customer]').focus();
+        dirty = true;
+        return;
+      }
+      const rm = e.target.closest('[data-remove-entry]');
+      if (rm) {
+        const entry = rm.closest('.entry');
+        if (entry.parentElement.children.length > 1) entry.remove();
+        else entry.querySelectorAll('input, textarea').forEach((x) => { x.value = ''; });
+        dirty = true;
+        form.dispatchEvent(new Event('input'));
+      }
+    });
+    form.addEventListener('input', (e) => { if (e.target.name === 'customer') fillContacts(e.target.closest('.entry')); });
+    if (me.department_id) bindCustomerPanel(form, report, allDepts, myCustomers, hooks);
     onSubmit(form, async (fd, action) => {
       const text = (k) => String(fd.get(k) || '').replace(/\r\n/g, '\n').trim();
       const submit = action === 'submit';
-      const daily = DAY_NAMES.map((_, i) => text('day' + i));
-      if (submit && !daily.some(Boolean) && !text('work_summary')) throw new Error('提交前請至少填寫一天的工作內容。');
+      const clean = (v) => String(v || '').replace(/\r\n/g, '\n').trim();
+      const daily = [...form.querySelectorAll('.day-block')].map((b) => [...b.querySelectorAll('.entry')].map((en) => ({
+        customer: clean(en.querySelector('[name=customer]').value),
+        contact: clean(en.querySelector('[name=contact]').value),
+        content: clean(en.querySelector('[name=content]').value),
+      })).filter((x) => x.customer || x.contact || x.content));
+      if (daily.some((d) => d.length > 20)) throw new Error('每天最多 20 筆。');
+      if (submit && !daily.some((d) => d.length) && !text('work_summary')) throw new Error('提交前請至少填寫一天的工作內容。');
       const week = report.id ? null : weekStartOf(String(fd.get('week') || ''));
       if (!report.id && !week) throw new Error('請選擇正確的週次日期。');
       const newId = must(await sb.rpc('save_report', {
         p_id: report.id, p_week: week,
-        p_work_summary: text('work_summary'), p_daily_work: daily, p_customer_visits: text('customer_visits'),
+        p_work_summary: text('work_summary'), p_daily_work: null, p_daily_entries: daily, p_customer_visits: text('customer_visits'),
         p_sales_progress: text('sales_progress'), p_next_week_plan: text('next_week_plan'),
         p_issues: text('issues'), p_submit: submit,
       }));
@@ -636,22 +700,39 @@
     });
   }
 
+  // 每日一筆拜訪的輸入欄（客戶、聯絡人、內容）
+  let entrySeq = 0;
+  function entryHtml(e) {
+    const n = ++entrySeq;
+    return `<div class="entry">
+      <div class="entry-meta">
+        <label class="entry-field">客戶<input name="customer" value="${esc(e.customer || '')}" maxlength="100" autocomplete="off" list="dl-customers" placeholder="可留空"></label>
+        <label class="entry-field">聯絡人<input name="contact" value="${esc(e.contact || '')}" maxlength="100" autocomplete="off" list="dl-contacts-${n}" placeholder="可留空"></label>
+        <datalist id="dl-contacts-${n}"></datalist>
+        <button type="button" class="entry-remove" data-remove-entry title="刪除這一筆" aria-label="刪除這一筆">✕</button>
+      </div>
+      <textarea name="content" rows="2" maxlength="4000" aria-label="工作內容" placeholder="工作內容，例：說明新方案、完成報價">${esc(e.content || '')}</textarea>
+    </div>`;
+  }
+
   // 填寫週報旁的「本週提到的客戶」與輸入建議
-  function bindCustomerPanel(form, report, allDepts, customers) {
-    const fields = [...form.querySelectorAll('textarea[name^=day], textarea[name=customer_visits], textarea[name=work_summary]')];
+  function bindCustomerPanel(form, report, allDepts, customers, hooks) {
+    const textFields = () => [...form.querySelectorAll('.entry [name=customer], .entry textarea[name=content], textarea[name=customer_visits], textarea[name=work_summary]')];
     const panel = root.querySelector('[data-cust-panel]');
     const listEl = panel.querySelector('[data-cust-list]');
     const recEl = panel.querySelector('[data-cust-records]');
-    let lastField = fields[0];
+    let lastField = textFields()[0];
     let selected = null;
     const cache = new Map();
-    fields.forEach((f) => f.addEventListener('focus', () => { lastField = f; }));
+    form.addEventListener('focusin', (e) => { if (e.target.matches('input[name=customer], textarea')) lastField = e.target; });
 
     const addCustomer = async (name) => {
       const id = await customerDialog({ name, departments: addableDepts(allDepts) });
       if (!id) return;
       const fresh = await loadCustomers();
       customers.splice(0, customers.length, ...fresh.filter((c) => c.department_id === me.department_id));
+      const dl = form.querySelector('#dl-customers');
+      if (dl) dl.innerHTML = customers.filter((c) => c.active).map((c) => `<option value="${esc(c.name)}">${esc(c.aliases.join('、'))}</option>`).join('');
       refresh();
       if (lastField) lastField.focus();
     };
@@ -675,7 +756,7 @@
       }
     };
     const refresh = () => {
-      const found = mentionedIn(fields.map((f) => f.value).join('\n'), customers);
+      const found = mentionedIn(textFields().map((f) => f.value).join('\n'), customers);
       if (selected && !found.some((c) => c.id === selected)) { selected = null; recEl.innerHTML = ''; }
       listEl.innerHTML = found.length
         ? `<ul class="cust-chips">${found.map((c) => `<li><button type="button" class="chip ${c.id === selected ? 'active' : ''}" data-cid="${c.id}">${esc(c.name)}</button></li>`).join('')}</ul>`
@@ -683,12 +764,14 @@
       listEl.querySelectorAll('[data-cid]').forEach((b) => b.addEventListener('click', () => showRecords(customers.find((c) => c.id === Number(b.dataset.cid)))));
     };
     let timer = null;
-    fields.forEach((f) => f.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 250); }));
+    form.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 250); });
     panel.querySelector('[data-cust-add]').addEventListener('click', () => {
       const sel = lastField ? lastField.value.slice(lastField.selectionStart, lastField.selectionEnd).trim() : '';
       addCustomer(sel.length <= 100 ? sel : '');
     });
-    attachCustomerSuggest(fields, () => customers, addCustomer);
+    hooks.bindContent = attachCustomerSuggest(
+      [...form.querySelectorAll('.entry textarea[name=content], textarea[name=customer_visits], textarea[name=work_summary]')],
+      () => customers, addCustomer);
     refresh();
   }
 
@@ -1142,6 +1225,7 @@
             <a href="#/customers" class="small">← 全部客戶</a>
             <h1>${esc(current.name)} ${current.active ? '' : '<span class="badge badge-muted">停用</span>'}</h1>
             <div class="muted">${esc(deptName[current.department_id] || '')}${current.aliases.length ? `，別名：${esc(current.aliases.join('、'))}` : ''}</div>
+            ${(current.contacts || []).length ? `<div class="muted small">聯絡人：${esc(current.contacts.join('、'))}</div>` : ''}
           </div>
           <div class="row-gap">
             ${canEditCustomer(current) ? `<button class="btn" data-edit="${current.id}">編輯客戶</button>` : ''}
