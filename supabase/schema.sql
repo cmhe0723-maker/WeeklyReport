@@ -108,7 +108,13 @@ alter table public.reports
   add column if not exists daily_work jsonb not null default '[]'::jsonb
   constraint reports_daily_work_chk
     check (jsonb_typeof(daily_work) = 'array' and jsonb_array_length(daily_work) <= 7);
-comment on column public.reports.daily_work      is '每日工作內容，陣列依序為週一～週日';
+comment on column public.reports.daily_work      is '每日工作內容（文字），陣列依序為週一～週日；有 daily_entries 時由其自動產生';
+-- 每日多筆拜訪：7 個陣列（週一～週日），每筆 {customer, contact, content}
+alter table public.reports
+  add column if not exists daily_entries jsonb not null default '[]'::jsonb
+  constraint reports_daily_entries_chk
+    check (jsonb_typeof(daily_entries) = 'array' and jsonb_array_length(daily_entries) <= 7);
+comment on column public.reports.daily_entries   is '每日多筆拜訪，陣列依序為週一～週日，每筆含 customer、contact、content';
 create index if not exists reports_week_start_idx  on public.reports (week_start);
 create index if not exists reports_reviewed_by_idx on public.reports (reviewed_by);
 create index if not exists reports_pending_idx     on public.reports (week_start)
@@ -138,7 +144,7 @@ end;
 $$;
 drop trigger if exists reports_set_updated_at on public.reports;
 create trigger reports_set_updated_at
-  before update of work_summary, daily_work, customer_visits, sales_progress, next_week_plan, issues, status
+  before update of work_summary, daily_work, daily_entries, customer_visits, sales_progress, next_week_plan, issues, status
   on public.reports
   for each row execute function private.set_updated_at();
 
@@ -259,9 +265,14 @@ grant select on public.departments, public.profiles, public.manager_departments,
 -- =============================================================================
 
 -- 新增或修改自己的週報。p_id 為 null 表示新增；p_submit = true 表示提交給主管
--- p_daily_work：每日工作內容，依序為週一～週日（最多 7 筆，每筆最多 4000 字）
+-- p_daily_entries：每日多筆拜訪，7 個陣列（週一～週日），每筆 {customer, contact, content}；
+--   每天最多 20 筆，客戶與聯絡人各最多 100 字、內容最多 4000 字。
+--   有傳入時，daily_work（每日文字）會自動由它產生，例如「環宇貿易（王經理）：說明新方案」。
+--   客戶欄若是自己部門名錄中的客戶（名稱或別名），聯絡人會自動加入該客戶的聯絡人清單。
+-- p_daily_work：舊版每日文字（每天一段）；p_daily_entries 為 null 時才使用，供舊版網頁相容
 -- p_work_summary：舊版「本週工作內容」欄位，新週報傳空字串即可
 drop function if exists public.save_report(bigint, date, text, text, text, text, text, boolean);
+drop function if exists public.save_report(bigint, date, text, text[], text, text, text, text, boolean);
 create or replace function public.save_report(
   p_id              bigint,
   p_week            date,
@@ -271,15 +282,25 @@ create or replace function public.save_report(
   p_sales_progress  text,
   p_next_week_plan  text,
   p_issues          text,
-  p_submit          boolean
+  p_submit          boolean,
+  p_daily_entries   jsonb default null
 ) returns bigint
 language plpgsql security definer set search_path = '' as $$
 declare
-  v_uid  uuid := auth.uid();
-  v_role text := private.my_role();
-  v_old  public.reports;
-  v_id   bigint;
-  v_days text[];
+  v_uid     uuid := auth.uid();
+  v_role    text := private.my_role();
+  v_old     public.reports;
+  v_id      bigint;
+  v_days    text[] := '{}';
+  v_entries jsonb := '[]'::jsonb;
+  v_day     jsonb;
+  v_list    jsonb;
+  v_lines   text[];
+  v_e       jsonb;
+  v_cust    text;
+  v_contact text;
+  v_content text;
+  i         integer;
 begin
   if v_role is null or v_role not in ('staff', 'manager') then
     raise exception '沒有權限填寫週報。';
@@ -290,17 +311,58 @@ begin
   p_next_week_plan  := btrim(coalesce(p_next_week_plan, ''));
   p_issues          := btrim(coalesce(p_issues, ''));
   p_submit          := coalesce(p_submit, false);
-  if coalesce(cardinality(p_daily_work), 0) > 7 then
-    raise exception '每日工作內容最多 7 天。';
+
+  if p_daily_entries is not null then
+    if jsonb_typeof(p_daily_entries) <> 'array' or jsonb_array_length(p_daily_entries) > 7 then
+      raise exception '每日工作內容格式不正確。';
+    end if;
+    for i in 0..6 loop
+      v_day := coalesce(p_daily_entries -> i, '[]'::jsonb);
+      if jsonb_typeof(v_day) <> 'array' then
+        raise exception '每日工作內容格式不正確。';
+      end if;
+      v_list := '[]'::jsonb;
+      v_lines := '{}';
+      for v_e in select value from jsonb_array_elements(v_day) loop
+        if jsonb_typeof(v_e) <> 'object' then
+          raise exception '每日工作內容格式不正確。';
+        end if;
+        v_cust    := left(btrim(coalesce(v_e ->> 'customer', '')), 100);
+        v_contact := left(btrim(coalesce(v_e ->> 'contact', '')), 100);
+        v_content := left(btrim(coalesce(v_e ->> 'content', '')), 4000);
+        continue when v_cust = '' and v_contact = '' and v_content = '';
+        v_list := v_list || jsonb_build_array(jsonb_build_object('customer', v_cust, 'contact', v_contact, 'content', v_content));
+        v_lines := array_append(v_lines,
+          case when v_cust = '' and v_contact = '' then v_content
+               else concat(v_cust,
+                           case when v_contact <> '' then '（' || v_contact || '）' end,
+                           case when v_content <> '' then '：' || v_content end) end);
+      end loop;
+      if jsonb_array_length(v_list) > 20 then
+        raise exception '每天最多 20 筆。';
+      end if;
+      v_entries := v_entries || jsonb_build_array(v_list);
+      v_days := array_append(v_days, left(array_to_string(v_lines, E'\n'), 20000));
+    end loop;
+  else
+    -- 舊版網頁：每天一段文字
+    if coalesce(cardinality(p_daily_work), 0) > 7 then
+      raise exception '每日工作內容最多 7 天。';
+    end if;
+    v_days := array(
+      select left(btrim(coalesce(d, '')), 4000)
+      from unnest(coalesce(p_daily_work, '{}'::text[])) with ordinality as t(d, n)
+      order by n
+    );
+    while coalesce(cardinality(v_days), 0) < 7 loop
+      v_days := array_append(v_days, '');
+    end loop;
+    for i in 1..7 loop
+      v_entries := v_entries || jsonb_build_array(case when v_days[i] = '' then '[]'::jsonb
+        else jsonb_build_array(jsonb_build_object('customer', '', 'contact', '', 'content', v_days[i])) end);
+    end loop;
   end if;
-  v_days := array(
-    select left(btrim(coalesce(d, '')), 4000)
-    from unnest(coalesce(p_daily_work, '{}'::text[])) with ordinality as t(d, i)
-    order by i
-  );
-  while coalesce(cardinality(v_days), 0) < 7 loop
-    v_days := array_append(v_days, '');
-  end loop;
+
   if p_submit and p_work_summary = '' and not exists (select 1 from unnest(v_days) d where d <> '') then
     raise exception '提交前請至少填寫一天的工作內容。';
   end if;
@@ -309,10 +371,10 @@ begin
     if p_week is null then
       raise exception '請選擇正確的週次日期。';
     end if;
-    insert into public.reports (user_id, week_start, work_summary, daily_work, customer_visits, sales_progress,
-                                next_week_plan, issues, status, submitted_at)
-    values (v_uid, date_trunc('week', p_week)::date, p_work_summary, to_jsonb(v_days), p_customer_visits, p_sales_progress,
-            p_next_week_plan, p_issues,
+    insert into public.reports (user_id, week_start, work_summary, daily_work, daily_entries, customer_visits,
+                                sales_progress, next_week_plan, issues, status, submitted_at)
+    values (v_uid, date_trunc('week', p_week)::date, p_work_summary, to_jsonb(v_days), v_entries, p_customer_visits,
+            p_sales_progress, p_next_week_plan, p_issues,
             case when p_submit then 'submitted' else 'draft' end,
             case when p_submit then now() end)
     on conflict (user_id, week_start) do nothing
@@ -320,27 +382,43 @@ begin
     if v_id is null then
       raise exception '該週已有週報，請改為編輯該份週報。';
     end if;
-    return v_id;
+  else
+    select * into v_old from public.reports where id = p_id and user_id = v_uid for update;
+    if not found then
+      raise exception '週報不存在。';
+    end if;
+    if v_old.reviewed_at is not null then
+      raise exception '此週報主管已查閱，無法再修改。如需修改請洽主管撤回查閱。';
+    end if;
+    update public.reports set
+      work_summary    = p_work_summary,
+      daily_work      = to_jsonb(v_days),
+      daily_entries   = v_entries,
+      customer_visits = p_customer_visits,
+      sales_progress  = p_sales_progress,
+      next_week_plan  = p_next_week_plan,
+      issues          = p_issues,
+      status          = case when p_submit then 'submitted' else 'draft' end,
+      submitted_at    = case when p_submit then coalesce(v_old.submitted_at, now()) end
+    where id = p_id;
+    v_id := p_id;
   end if;
 
-  select * into v_old from public.reports where id = p_id and user_id = v_uid for update;
-  if not found then
-    raise exception '週報不存在。';
-  end if;
-  if v_old.reviewed_at is not null then
-    raise exception '此週報主管已查閱，無法再修改。如需修改請洽主管撤回查閱。';
-  end if;
-  update public.reports set
-    work_summary    = p_work_summary,
-    daily_work      = to_jsonb(v_days),
-    customer_visits = p_customer_visits,
-    sales_progress  = p_sales_progress,
-    next_week_plan  = p_next_week_plan,
-    issues          = p_issues,
-    status          = case when p_submit then 'submitted' else 'draft' end,
-    submitted_at    = case when p_submit then coalesce(v_old.submitted_at, now()) end
-  where id = p_id;
-  return p_id;
+  -- 聯絡人自動加入自己部門名錄中對應客戶的聯絡人清單（不分大小寫、不重複，每家最多 100 位）
+  for v_e in
+    select e.value from jsonb_array_elements(v_entries) as d(value), jsonb_array_elements(d.value) as e(value)
+  loop
+    v_cust := v_e ->> 'customer';
+    v_contact := v_e ->> 'contact';
+    continue when v_cust = '' or v_contact = '';
+    update public.customers c
+       set contacts = c.contacts || array[v_contact]
+     where c.department_id = private.my_dept()
+       and (lower(c.name) = lower(v_cust) or lower(v_cust) = any (array(select lower(a) from unnest(c.aliases) as a)))
+       and not (lower(v_contact) = any (array(select lower(x) from unnest(c.contacts) as x)))
+       and cardinality(c.contacts) < 100;
+  end loop;
+  return v_id;
 end;
 $$;
 
@@ -630,6 +708,11 @@ create table if not exists public.customers (
 comment on table  public.customers         is '客戶名錄（依部門）';
 comment on column public.customers.aliases is '簡稱或別名，例如「大成」＝「大成科技」';
 create unique index if not exists customers_dept_name_key on public.customers (department_id, lower(name));
+-- 聯絡人清單：填寫週報時自動累積，主管與系統管理員可在「編輯客戶」修改
+alter table public.customers
+  add column if not exists contacts text[] not null default '{}'
+  constraint customers_contacts_chk check (cardinality(contacts) <= 100);
+comment on column public.customers.contacts is '聯絡人清單（填寫週報時自動加入）';
 
 drop trigger if exists customers_set_updated_at on public.customers;
 create trigger customers_set_updated_at
@@ -664,12 +747,15 @@ revoke all on public.customers from anon, authenticated;
 grant select on public.customers to authenticated;
 
 -- 新增（p_id 為 null）或修改客戶。業務人員只能新增；修改、停用需主管或系統管理員
+-- p_contacts：聯絡人清單；修改時傳 null 表示不變更
+drop function if exists public.save_customer(bigint, bigint, text, text[], boolean);
 create or replace function public.save_customer(
   p_id            bigint,
   p_department_id bigint,
   p_name          text,
   p_aliases       text[],
-  p_active        boolean
+  p_active        boolean,
+  p_contacts      text[] default null
 ) returns bigint
 language plpgsql security definer set search_path = '' as $$
 declare
@@ -703,6 +789,22 @@ begin
   if p_department_id is null or not exists (select 1 from public.departments where id = p_department_id) then
     raise exception '請選擇客戶所屬的部門。';
   end if;
+  if p_contacts is not null then
+    p_contacts := array(
+      select c from (
+        select distinct on (lower(c)) c, n
+        from (select btrim(x) as c, n from unnest(p_contacts) with ordinality as t(x, n)) s
+        where c <> ''
+        order by lower(c), n
+      ) d order by n
+    );
+    if cardinality(p_contacts) > 100 then
+      raise exception '聯絡人最多 100 位。';
+    end if;
+    if exists (select 1 from unnest(p_contacts) c where char_length(c) > 100) then
+      raise exception '每位聯絡人最多 100 個字。';
+    end if;
+  end if;
 
   if p_id is null then
     if not private.can_view_customers(p_department_id) then
@@ -728,12 +830,13 @@ begin
   end if;
 
   if p_id is null then
-    insert into public.customers (department_id, name, aliases, created_by)
-    values (p_department_id, p_name, p_aliases, auth.uid())
+    insert into public.customers (department_id, name, aliases, contacts, created_by)
+    values (p_department_id, p_name, p_aliases, coalesce(p_contacts, '{}'), auth.uid())
     returning id into v_id;
   else
     update public.customers
        set department_id = p_department_id, name = p_name, aliases = p_aliases,
+           contacts = coalesce(p_contacts, contacts),
            active = coalesce(p_active, active)
      where id = p_id
     returning id into v_id;

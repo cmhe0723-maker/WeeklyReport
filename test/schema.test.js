@@ -312,3 +312,56 @@ test('刪除客戶：只有系統管理員可以，週報內容不受影響', as
   assert.strictEqual((await sys('select count(*)::int as c from reports'))[0].c, reportsBefore, '週報不受影響');
   await assert.rejects(as(admin, 'select public.admin_delete_customer($1)', [cid]), /客戶不存在/);
 });
+
+test('每日多筆拜訪：客戶、聯絡人、內容，聯絡人自動加入名錄', async () => {
+  const [{ id: dept }] = await sys("select id from departments where name = '客戶測試部'");
+  const [{ id: mgr }] = await sys("select id from profiles where username = 'mgr3'");
+  const [{ id: staff }] = await sys("select id from profiles where username = 'sales1'");
+  const [{ id: other }] = await sys("select id from profiles where username = 'sales4'"); // 別部門
+  const cid = await as(mgr, "select public.save_customer(null, $1, '環宇貿易', array['環宇'], true) as id", [dept]).then((r) => r[0].id);
+  const saveEntries = (uid, id, week, entries, submit) => as(uid,
+    `select public.save_report(p_id => $1, p_week => $2, p_work_summary => '', p_daily_work => null, p_daily_entries => $3::jsonb,
+       p_customer_visits => '', p_sales_progress => '', p_next_week_plan => '', p_issues => '', p_submit => $4) as id`,
+    [id, week, JSON.stringify(entries), submit]).then((r) => r[0].id);
+  const W = '2026-12-21';
+
+  const id = await saveEntries(staff, null, W, [
+    [{ customer: ' 環宇貿易 ', contact: '王經理', content: '說明新方案' }, { customer: '', contact: '', content: '' }, { customer: '', contact: '', content: '整理報價單' }],
+    [],
+    [{ customer: '環宇', contact: '王經理', content: '' }, { customer: '環宇', contact: '李小姐', content: '追蹤樣品' }],
+  ], true);
+  const [r] = await sys('select daily_entries, daily_work from reports where id = $1', [id]);
+  assert.deepStrictEqual(r.daily_entries[0], [
+    { customer: '環宇貿易', contact: '王經理', content: '說明新方案' },
+    { customer: '', contact: '', content: '整理報價單' },
+  ], '去除空白筆數與前後空白');
+  assert.strictEqual(r.daily_entries.length, 7);
+  assert.deepStrictEqual(r.daily_work, ['環宇貿易（王經理）：說明新方案\n整理報價單', '', '環宇（王經理）\n環宇（李小姐）：追蹤樣品', '', '', '', '']);
+  // 聯絡人自動加入（別名也能對應、不重複）
+  assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
+  // 大小寫不同視為同一人；別部門的人寫同名客戶不會加到這個部門
+  await saveEntries(staff, id, null, [[{ customer: '環宇貿易', contact: 'amy chen', content: 'x' }], [], [{ customer: '環宇貿易', contact: 'Amy Chen', content: 'y' }]], true);
+  await saveEntries(other, null, W, [[{ customer: '環宇貿易', contact: '別部門聯絡人', content: 'z' }]], true);
+  assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐', 'amy chen']);
+
+  // 客戶紀錄查詢：以每日文字比對，週一、週三各算 1 次
+  const rec = await as(mgr, 'select day_index, content from public.customer_records($1)', [cid]);
+  assert.deepStrictEqual(rec.map((x) => x.day_index), [2, 0]);
+
+  // 限制
+  await assert.rejects(saveEntries(staff, id, null, [Array.from({ length: 21 }, (_, n) => ({ content: 'c' + n }))], true), /每天最多 20 筆/);
+  await assert.rejects(saveEntries(staff, id, null, [[{ customer: '環宇', contact: '', content: '' }].map(() => 'bad')], true), /格式不正確/);
+  await assert.rejects(saveEntries(staff, id, null, [[], [], []], true), /至少填寫一天/);
+
+  // 舊版網頁（只傳 p_daily_work）仍可使用，並轉成每天一筆
+  const oldId = await saveDays(staff, null, '2026-12-28', ['舊版內容'], true);
+  assert.deepStrictEqual((await sys('select daily_entries->0 as d from reports where id = $1', [oldId]))[0].d, [{ customer: '', contact: '', content: '舊版內容' }]);
+
+  // 主管可在「編輯客戶」修正聯絡人；業務不行
+  await as(mgr, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true, array['王經理', ' 李小姐 ', '王經理', '']) as id", [cid, dept]);
+  assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
+  await assert.rejects(as(staff, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true, array['x'])", [cid, dept]), /只有主管或系統管理員/);
+  // 不傳聯絡人（舊版網頁）時保留原清單
+  await as(mgr, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true) as id", [cid, dept]);
+  assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
+});
