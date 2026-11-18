@@ -1076,6 +1076,11 @@
   }
 
   /* ------------------------------------------------------------------ 客戶 */
+  // 刪除客戶（系統管理員）：只刪名錄，週報內容不變
+  function delCustomerBtn(c, size) {
+    const msg = `確定刪除客戶「${c.name}」？\n\n只會從客戶名錄移除，週報內容不會刪除；日後重新加入同名客戶，紀錄會再出現。\n若只是不想再出現在輸入建議，可改用「編輯」→ 取消「使用中」來停用。`;
+    return `<button class="btn ${size} btn-danger-outline" data-del-cust="${c.id}" data-confirm="${esc(msg)}">刪除</button>`;
+  }
   async function pageCustomers(query) {
     const [customers, allDepts] = await Promise.all([loadCustomers(), sb.from('departments').select('id, name').order('name').then(must)]);
     const deptName = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
@@ -1121,7 +1126,8 @@
                 <td class="num">${t.records}</td>
                 <td class="nowrap">${t.last ? t.last.replace(/-/g, '/') : '<span class="muted">—</span>'}</td>
                 <td>${c.active ? '使用中' : '<span class="badge badge-muted">停用</span>'}</td>
-                <td class="right">${canEditCustomer(c) ? `<button class="btn btn-sm" data-edit="${c.id}">編輯</button>` : ''}</td>
+                <td class="right nowrap">${canEditCustomer(c) ? `<button class="btn btn-sm" data-edit="${c.id}">編輯</button>` : ''}
+                  ${me.role === 'admin' ? delCustomerBtn(c, 'btn-sm') : ''}</td>
               </tr>`;
             }).join('')}</tbody>
           </table></div>`}
@@ -1137,7 +1143,10 @@
             <h1>${esc(current.name)} ${current.active ? '' : '<span class="badge badge-muted">停用</span>'}</h1>
             <div class="muted">${esc(deptName[current.department_id] || '')}${current.aliases.length ? `，別名：${esc(current.aliases.join('、'))}` : ''}</div>
           </div>
-          ${canEditCustomer(current) ? `<button class="btn" data-edit="${current.id}">編輯客戶</button>` : ''}
+          <div class="row-gap">
+            ${canEditCustomer(current) ? `<button class="btn" data-edit="${current.id}">編輯客戶</button>` : ''}
+            ${me.role === 'admin' ? delCustomerBtn(current, '') : ''}
+          </div>
         </div>
         ${searchBox}
         <div class="stats cust-stats">
@@ -1209,6 +1218,14 @@
     });
     input.addEventListener('blur', () => setTimeout(() => { results.hidden = true; }, 150));
 
+    root.querySelectorAll('[data-del-cust]').forEach((b) => b.addEventListener('click', async () => {
+      const c = customers.find((x) => x.id === Number(b.dataset.delCust));
+      try {
+        must(await sb.rpc('admin_delete_customer', { p_id: c.id }));
+        setFlash('success', `已刪除客戶「${c.name}」。週報內容沒有變動。`);
+        go('/customers');
+      } catch (e) { window.alert(e.message); }
+    }));
     const reload = () => go('/customers' + (current ? '?id=' + current.id : ''));
     const add = root.querySelector('[data-add]');
     if (add) add.addEventListener('click', async () => {

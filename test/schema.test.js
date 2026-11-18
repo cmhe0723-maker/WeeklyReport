@@ -296,3 +296,19 @@ test('客戶名錄：依部門隔開、權限與別名防重複', async () => {
   assert.strictEqual((await as(s1, 'select active from public.customers where id = $1', [c3]))[0].active, false);
   assert.strictEqual((await rec(s1, c3)).length, 3);
 });
+
+test('刪除客戶：只有系統管理員可以，週報內容不受影響', async () => {
+  const [{ id: dept }] = await sys("select id from departments where name = '客戶測試部'");
+  const [{ id: mgr }] = await sys("select id from profiles where username = 'mgr3'");
+  const [{ id: staff }] = await sys("select id from profiles where username = 'sales1'");
+  const cid = await as(mgr, "select public.save_customer(null, $1, '待刪客戶', array['待刪'], true) as id", [dept]).then((r) => r[0].id);
+  const reportsBefore = (await sys('select count(*)::int as c from reports'))[0].c;
+  await assert.rejects(as(staff, 'select public.admin_delete_customer($1)', [cid]), /只有系統管理員/);
+  await assert.rejects(as(mgr, 'select public.admin_delete_customer($1)', [cid]), /只有系統管理員/);
+  await assert.rejects(as(null, 'select public.admin_delete_customer($1)', [cid]), /permission denied/);
+  await assert.rejects(as(mgr, 'delete from public.customers where id = $1', [cid]), /permission denied/);
+  await as(admin, 'select public.admin_delete_customer($1)', [cid]);
+  assert.strictEqual((await sys('select count(*)::int as c from customers where id = $1', [cid]))[0].c, 0);
+  assert.strictEqual((await sys('select count(*)::int as c from reports'))[0].c, reportsBefore, '週報不受影響');
+  await assert.rejects(as(admin, 'select public.admin_delete_customer($1)', [cid]), /客戶不存在/);
+});
