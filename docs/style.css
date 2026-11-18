@@ -327,3 +327,49 @@ a.cell:hover { text-decoration: none; outline: 2px solid var(--blue); outline-of
   .stat { padding: 4pt 8pt; }
   .badge, .cell, .stat, .tag, .seal, th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
+
+/* ===== 客戶名錄與紀錄 ===== */
+mark { background: #fbe8b4; color: inherit; padding: 0 1px; border-radius: 2px; }
+/* 輸入建議 */
+.suggest { position: absolute; z-index: 50; background: var(--paper); border: 1px solid var(--rule); border-radius: var(--radius-m); box-shadow: var(--sheet-shadow); padding: .25rem 0; max-height: 18rem; overflow-y: auto; }
+.suggest-item { display: flex; flex-direction: column; gap: .05rem; padding: .45rem .8rem; cursor: pointer; color: var(--ink); }
+.suggest-item.active, .suggest-item:hover { background: var(--blue-wash); text-decoration: none; }
+.suggest-item strong { font-weight: 600; }
+.suggest-add { color: var(--blue); font-size: .9rem; }
+/* 填寫週報：表單＋客戶面板 */
+.form-layout.has-panel { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 1.5rem; align-items: start; }
+.customer-panel { position: sticky; top: 1.5rem; }
+.customer-panel h3 { margin-top: 0; }
+.customer-panel h4 { font-family: var(--serif); font-size: .95rem; margin: 1rem 0 .4rem; padding-top: .8rem; border-top: 1px solid var(--rule-soft); }
+.customer-panel [data-cust-add] { margin-top: 1rem; }
+.cust-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: .4rem; }
+.chip { font: inherit; font-size: .88rem; padding: .2rem .65rem; border-radius: 3px; border: 1px solid var(--rule); background: var(--paper); color: var(--ink); cursor: pointer; }
+.chip:hover { border-color: var(--blue); }
+.chip.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+.cust-records { list-style: none; margin: 0 0 .5rem; padding: 0; }
+.cust-records li { padding: .45rem 0; border-bottom: 1px solid var(--rule-soft); font-size: .9rem; }
+.cust-records li a { font-weight: 600; margin-right: .4rem; }
+.snippet { color: var(--ink); font-size: .9rem; line-height: 1.6; word-break: break-word; }
+/* 客戶頁 */
+.cust-search { position: relative; margin-bottom: 1.25rem; max-width: 520px; }
+.cust-search input { padding: .65rem .9rem; font-size: 1rem; }
+.cust-results { left: 0; right: 0; top: calc(100% + 4px); }
+.cust-stats { grid-template-columns: 1fr 1fr 2fr; }
+.stat-people { font-size: .9rem; }
+.cust-timeline { list-style: none; margin: 0; padding: 0; }
+.cust-timeline li { padding: .8rem 0; border-bottom: 1px solid var(--rule-soft); }
+.cust-timeline li:last-child { border-bottom: 0; }
+.cust-rec-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .9rem; margin-bottom: .25rem; }
+.cust-rec-head a { margin-left: auto; }
+.num { text-align: right; }
+/* 對話框 */
+.customer-dialog { border: 0; border-top: 3px solid var(--ink); border-radius: 2px; padding: 1.6rem 1.8rem; width: min(460px, calc(100vw - 32px)); box-shadow: var(--sheet-shadow); color: var(--ink); }
+.customer-dialog::backdrop { background: rgba(36, 49, 58, .35); }
+.customer-dialog h2 { margin: 0; }
+@media (max-width: 860px) {
+  .form-layout.has-panel { grid-template-columns: 1fr; }
+  .customer-panel { position: static; }
+  .cust-stats { grid-template-columns: 1fr 1fr; }
+  .cust-stats .stat-people { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--rule-soft); }
+}
+@media print { .customer-panel, .cust-search, .suggest { display: none !important; } }

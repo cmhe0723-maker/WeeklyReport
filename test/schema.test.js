@@ -222,3 +222,77 @@ test('每日工作內容：依週一～週日儲存、補齊 7 天、限制天�
   const [v] = await as(boss, 'select daily_work from public.reports where id = $1', [id]);
   assert.strictEqual(v.daily_work[6], '週日展覽');
 });
+
+test('客戶名錄：依部門隔開、權限與別名防重複', async () => {
+  const d3 = await as(admin, "select public.admin_save_department(null, '客戶測試部') as id").then((r) => r[0].id);
+  const mgr3 = await rpcUser(admin, { username: 'mgr3', name: '張主管', role: 'manager', dept: d3, managed: [d3], password: 'pass12345' });
+  const s1 = await rpcUser(admin, { username: 'sales1', name: '業務甲', role: 'staff', dept: d3, password: 'pass12345' });
+  const s2 = await rpcUser(admin, { username: 'sales2', name: '業務乙', role: 'staff', dept: d3, password: 'pass12345' });
+  const s4 = await rpcUser(admin, { username: 'sales4', name: '業務丁', role: 'staff', dept: d2, password: 'pass12345' });
+  const saveCust = (uid, f) => as(uid, 'select public.save_customer($1,$2,$3,$4,$5) as id',
+    [f.id || null, f.dept, f.name, f.aliases || [], f.active ?? true]).then((r) => r[0].id);
+  const names = async (uid) => (await as(uid, 'select name, department_id from public.customers order by department_id, name'))
+    .map((c) => `${c.department_id === d3 ? 'd3' : 'd2'}:${c.name}`);
+
+  // 先寫週報，之後才建客戶 → 舊週報也要找得到
+  const W1 = '2026-10-05';
+  const W2 = '2026-10-12';
+  await saveDays(s1, null, W1, ['拜訪大成科技，說明方案', '', 'dc電子報價'], true);
+  const s1w2 = await saveDays(s1, null, W2, ['內部會議'], true);
+  await as(s1, `select public.save_report(p_id => $1, p_week => null, p_work_summary => '', p_daily_work => array['內部會議'],
+    p_customer_visits => '與大成開會', p_sales_progress => '', p_next_week_plan => '', p_issues => '', p_submit => true)`, [s1w2]);
+  await saveDays(s1, null, '2026-10-19', ['大成科技（草稿不列入）'], false);
+  await saveDays(s2, null, W1, ['', '大成科技簽約'], true);
+  await saveDays(s4, null, W1, ['南區拜訪大成科技'], true);
+
+  // 新增：業務只能加到自己部門
+  const c3 = await saveCust(s1, { dept: d3, name: '大成科技', aliases: [' 大成 ', '大成', '大成科技', ''] });
+  assert.deepStrictEqual((await sys('select aliases, created_by from customers where id = $1', [c3]))[0], { aliases: ['大成'], created_by: s1 });
+  await assert.rejects(saveCust(s1, { dept: d2, name: '別部門客戶' }), /不能在這個部門新增/);
+  await assert.rejects(saveCust(s2, { dept: d3, name: '大成' }), /「大成」已經是客戶「大成科技」/);
+  await assert.rejects(saveCust(s2, { dept: d3, name: '新客戶', aliases: ['大'] }), /2–50 個字/);
+  // 不同部門可以有同名客戶
+  const c2 = await saveCust(s4, { dept: d2, name: '大成科技' });
+  // 修改：業務不行，主管可以
+  await assert.rejects(saveCust(s1, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'] }), /只有主管或系統管理員/);
+  await saveCust(mgr3, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'] });
+  await assert.rejects(saveCust(mgr3, { id: c2, dept: d2, name: '大成科技' }), /客戶不存在/);
+  await assert.rejects(as(s1, "update public.customers set name = 'x'"), /permission denied/);
+
+  // 名錄可見範圍
+  assert.deepStrictEqual(await names(s1), ['d3:大成科技']);
+  assert.deepStrictEqual(await names(s4), ['d2:大成科技']);
+  assert.deepStrictEqual(await names(mgr3), ['d3:大成科技']);
+  assert.deepStrictEqual((await names(admin)).sort(), ['d2:大成科技', 'd3:大成科技']);
+  await assert.rejects(as(null, 'select * from public.customers'), /permission denied/);
+
+  // 紀錄：業務只看到自己的（週一、週三＋第二週「客戶拜訪紀錄」1 筆；草稿不列入）
+  const rec = (uid, id, limit = 50, offset = 0) => as(uid, 'select * from public.customer_records($1, $2, $3)', [id, limit, offset]);
+  const r1 = await rec(s1, c3);
+  assert.deepStrictEqual(r1.map((r) => [r.field, r.day_index, String(r.record_date.toISOString().slice(0, 10))]), [
+    ['customer_visits', null, W2],
+    ['daily', 2, '2026-10-07'],
+    ['daily', 0, W1],
+  ]);
+  assert.match(r1[1].content, /dc電子/); // 事後加的別名、不分大小寫
+  assert.strictEqual((await rec(s2, c3)).length, 1);
+  assert.strictEqual((await rec(s4, c3)).length, 0, '看不到別部門的客戶');
+  assert.strictEqual((await rec(mgr3, c3)).length, 4);
+  assert.strictEqual((await rec(admin, c3)).length, 4);
+  assert.deepStrictEqual((await rec(admin, c2)).map((r) => r.author_name), ['業務丁'], '別部門的同名客戶各自計算');
+  assert.strictEqual((await rec(mgr3, c3, 2, 2)).length, 2, '分頁');
+
+  // 統計
+  const st = await as(mgr3, 'select author_name, records::int, last_date::text from public.customer_stats($1) order by author_name', [[c3]]);
+  assert.deepStrictEqual(st, [
+    { author_name: '業務乙', records: 1, last_date: '2026-10-06' },
+    { author_name: '業務甲', records: 3, last_date: W2 },
+  ]);
+  const own = await as(s1, 'select author_name, records::int from public.customer_stats($1)', [[c3]]);
+  assert.deepStrictEqual(own, [{ author_name: '業務甲', records: 3 }]);
+
+  // 停用：主管可停用，名錄仍看得到、紀錄仍查得到
+  await saveCust(mgr3, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'], active: false });
+  assert.strictEqual((await as(s1, 'select active from public.customers where id = $1', [c3]))[0].active, false);
+  assert.strictEqual((await rec(s1, c3)).length, 3);
+});

@@ -158,9 +158,171 @@
   function bindPrint() {
     root.querySelectorAll('[data-print]').forEach((b) => b.addEventListener('click', () => window.print()));
   }
+  /* ---------- 客戶名錄共用 ---------- */
+  const FIELD_LABELS = { daily: '每日工作內容', customer_visits: '客戶拜訪紀錄', work_summary: '本週工作內容' };
+  async function loadCustomers() {
+    return must(await sb.from('customers').select('id, department_id, name, aliases, active').order('name'));
+  }
+  const termsOf = (c) => [c.name, ...(c.aliases || [])];
+  // 文字中提到的客戶
+  function mentionedIn(text, customers) {
+    const t = text.toLowerCase();
+    return customers.filter((c) => termsOf(c).some((term) => t.includes(term.toLowerCase())));
+  }
+  // 可以新增客戶的部門：業務＝自己部門；主管＝負責部門＋自己部門；系統管理員＝全部
+  function addableDepts(allDepts) {
+    if (me.role === 'admin') return allDepts;
+    return allDepts.filter((d) => d.id === me.department_id || (me.role === 'manager' && myManaged.includes(d.id)));
+  }
+  const canEditCustomer = (c) => me.role === 'admin' || (me.role === 'manager' && myManaged.includes(c.department_id));
+  const escRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // 擷取提到客戶的那一段文字，並標示客戶名稱
+  function snippetHtml(content, terms, radius = 45) {
+    const text = String(content || '').replace(/\s+/g, ' ').trim();
+    const lower = text.toLowerCase();
+    const hits = terms.map((t) => lower.indexOf(t.toLowerCase())).filter((i) => i >= 0);
+    const at = hits.length ? Math.min(...hits) : 0;
+    const start = Math.max(0, at - radius);
+    const end = Math.min(text.length, at + radius * 2);
+    const part = text.slice(start, end);
+    const re = new RegExp('(' + [...terms].sort((a, b) => b.length - a.length).map(escRe).join('|') + ')', 'gi');
+    const html = part.split(re).map((seg, i) => (i % 2 ? `<mark>${esc(seg)}</mark>` : esc(seg))).join('');
+    return (start > 0 ? '…' : '') + html + (end < text.length ? '…' : '');
+  }
+  function recordDateLabel(r) {
+    if (r.day_index == null) return weekLabel(r.week_start);
+    return `${r.record_date.replace(/-/g, '/')}（週${DAY_NAMES[r.day_index]}）`;
+  }
+  const parseAliases = (v) => String(v || '').split(/[、,，;；\n]/).map((x) => x.trim()).filter(Boolean);
+
+  // 新增／編輯客戶的對話框；完成時回傳客戶 id，取消回傳 null
+  function customerDialog({ customer, name, departments }) {
+    return new Promise((resolve) => {
+      const editing = Boolean(customer);
+      const depts = editing && me.role !== 'admin' ? departments.filter((d) => myManaged.includes(d.id)) : departments;
+      const dlg = document.createElement('dialog');
+      dlg.className = 'customer-dialog';
+      dlg.innerHTML = `
+        <form method="dialog" class="stack" data-cust-form>
+          <h2>${editing ? '編輯客戶' : '新增客戶到名錄'}</h2>
+          <div data-error></div>
+          ${depts.length > 1 ? `<label>部門<select name="department_id">${depts.map((d) => `<option value="${d.id}" ${d.id === (customer ? customer.department_id : me.department_id) ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>`
+            : `<input type="hidden" name="department_id" value="${depts[0] ? depts[0].id : ''}"><p class="muted small">加入「${esc(depts[0] ? depts[0].name : '')}」的客戶名錄</p>`}
+          <label>客戶名稱（正式名稱）<input name="name" value="${esc(customer ? customer.name : name || '')}" maxlength="100" required autocomplete="off"></label>
+          <label>別名或簡稱 <span class="hint">用「、」或逗號分隔，每個至少 2 個字</span>
+            <input name="aliases" value="${esc(customer ? customer.aliases.join('、') : '')}" placeholder="例：大成、大成電子" autocomplete="off"></label>
+          ${editing ? `<label class="check-label"><input type="checkbox" name="active" value="1" ${customer.active ? 'checked' : ''}> 使用中（取消勾選即停用，不再出現在輸入建議）</label>` : ''}
+          <div class="actions"><button type="button" class="btn" data-cancel>取消</button><button class="btn btn-primary" value="save">${editing ? '儲存' : '加入名錄'}</button></div>
+        </form>`;
+      document.body.appendChild(dlg);
+      const done = (v) => { dlg.close(); dlg.remove(); resolve(v); };
+      dlg.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+      dlg.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+      const form = dlg.querySelector('form');
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const btn = form.querySelector('button.btn-primary');
+        btn.disabled = true;
+        try {
+          const id = must(await sb.rpc('save_customer', {
+            p_id: customer ? customer.id : null,
+            p_department_id: Number(fd.get('department_id')) || null,
+            p_name: String(fd.get('name') || '').trim(),
+            p_aliases: parseAliases(fd.get('aliases')),
+            p_active: editing ? fd.get('active') === '1' : true,
+          }));
+          done(id);
+        } catch (err) {
+          form.querySelector('[data-error]').innerHTML = `<div class="alert alert-error">${esc(err.message)}</div>`;
+          btn.disabled = false;
+        }
+      });
+      dlg.showModal();
+      dlg.querySelector('input[name=name]').focus();
+    });
+  }
+
+  // 輸入時的客戶建議（支援注音等輸入法：選字完成後才比對）
+  function attachCustomerSuggest(textareas, getCustomers, onAdd) {
+    const box = document.createElement('div');
+    box.className = 'suggest';
+    box.setAttribute('role', 'listbox');
+    box.hidden = true;
+    document.body.appendChild(box);
+    let state = null; // { ta, k, items: [{ c } | { add: frag }], active }
+    const close = () => { box.hidden = true; state = null; };
+    const choose = (item) => {
+      const { ta, k } = state;
+      const caret = ta.selectionStart;
+      close();
+      if (item.add !== undefined) return onAdd(item.add);
+      ta.focus();
+      ta.setRangeText(item.c.name, caret - k, caret, 'end');
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const render = () => {
+      box.innerHTML = state.items.map((it, i) => `<div class="suggest-item ${i === state.active ? 'active' : ''}" role="option" data-i="${i}" aria-selected="${i === state.active}">
+        ${it.c ? `<strong>${esc(it.c.name)}</strong>${it.c.aliases.length ? `<span class="muted small">別名：${esc(it.c.aliases.join('、'))}</span>` : ''}`
+               : `<span class="suggest-add">＋ 新增「${esc(it.add)}」到客戶名錄</span>`}
+      </div>`).join('');
+      const r = state.ta.getBoundingClientRect();
+      box.style.left = `${r.left + window.scrollX}px`;
+      box.style.top = `${r.bottom + window.scrollY + 4}px`;
+      box.style.width = `${Math.min(r.width, 380)}px`;
+      box.hidden = false;
+    };
+    const update = (ta) => {
+      const caret = ta.selectionStart;
+      if (caret !== ta.selectionEnd) return close();
+      const pre = ta.value.slice(0, caret);
+      const lower = pre.toLowerCase();
+      const list = getCustomers().filter((c) => c.active);
+      // 游標前已是完整的客戶名稱就不提示
+      if (list.some((c) => lower.endsWith(c.name.toLowerCase()))) return close();
+      for (let k = Math.min(20, pre.length); k >= 2; k--) {
+        const frag = lower.slice(-k);
+        if (/\s/.test(frag)) continue;
+        const hits = list.filter((c) => termsOf(c).some((t) => t.toLowerCase().startsWith(frag)));
+        if (hits.length) {
+          state = { ta, k, active: 0, items: [...hits.slice(0, 5).map((c) => ({ c })), { add: pre.slice(-k) }] };
+          return render();
+        }
+      }
+      close();
+    };
+    textareas.forEach((ta) => {
+      ta.setAttribute('aria-autocomplete', 'list');
+      ta.addEventListener('input', (e) => { if (!e.isComposing) update(ta); });
+      ta.addEventListener('compositionend', () => update(ta));
+      ta.addEventListener('keydown', (e) => {
+        if (!state || state.ta !== ta || e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          state.active = (state.active + (e.key === 'ArrowDown' ? 1 : -1) + state.items.length) % state.items.length;
+          render();
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+          e.preventDefault();
+          choose(state.items[state.active]);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          close();
+        }
+      });
+      ta.addEventListener('blur', () => setTimeout(() => { if (state && state.ta === ta && document.activeElement !== ta) close(); }, 150));
+    });
+    box.addEventListener('mousedown', (e) => {
+      const el = e.target.closest('[data-i]');
+      if (!el) return;
+      e.preventDefault();
+      choose(state.items[Number(el.dataset.i)]);
+    });
+    window.addEventListener('hashchange', () => box.remove(), { once: true });
+  }
+
   // 查看週報後可返回的列表頁
   function safeBack(v) {
-    return typeof v === 'string' && /^\/(review|stats|print)(\?|$)/.test(v) ? v : null;
+    return typeof v === 'string' && /^\/(review|stats|print|customers)(\?|$)/.test(v) ? v : null;
   }
   function badge(state) {
     const [t, c] = { missing: ['未提交', 'muted'], draft: ['草稿', 'muted'], pending: ['待查閱', 'warn'], reviewed: ['已查閱', 'ok'] }[state];
@@ -212,6 +374,7 @@
         <nav class="nav">
           ${isWriter() ? navLink('/reports', '我的週報', section === 'reports') : ''}
           ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') + navLink('/stats', '繳交統計', section === 'stats') : ''}
+          ${navLink('/customers', '客戶', section === 'customers')}
           ${me.role === 'admin' ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
         </nav>
         <div class="me">
@@ -389,6 +552,14 @@
     const prev = must(await sb.from('reports').select('week_start, next_week_plan')
       .eq('user_id', me.id).lt('week_start', report.week_start).neq('next_week_plan', '')
       .order('week_start', { ascending: false }).limit(1).maybeSingle());
+    // 自己部門的客戶名錄（建議與「本週提到的客戶」都以填寫人的部門為準）
+    let allDepts = [];
+    let myCustomers = [];
+    if (me.department_id) {
+      const [cs, ds] = await Promise.all([loadCustomers(), sb.from('departments').select('id, name').order('name').then(must)]);
+      myCustomers = cs.filter((c) => c.department_id === me.department_id);
+      allDepts = ds;
+    }
 
     const days = dailyOf(report);
     const dayField = (i) => `<label class="day-field"><span data-day-label="${i}">${dayLabelHtml(report.week_start, i)}</span>
@@ -399,6 +570,7 @@
         <h1>${report.id ? '編輯週報' : '填寫週報'}</h1>
         <a href="#${report.id ? '/reports/' + report.id : '/reports'}">← 返回</a>
       </div>
+      <div class="form-layout ${me.department_id ? 'has-panel' : ''}">
       <form class="card stack report-form" data-form>
         <div data-error></div>
         <div class="field-row">
@@ -427,7 +599,14 @@
             ? '<button class="btn" value="draft" data-confirm="改回草稿後主管將看不到這份週報，確定嗎？">改回草稿</button><button class="btn btn-primary" value="submit">更新並提交</button>'
             : '<button class="btn" value="draft">儲存草稿</button><button class="btn btn-primary" value="submit">提交給主管</button>'}
         </div>
-      </form>`, 'reports');
+      </form>
+      ${me.department_id ? `<aside class="card customer-panel" data-cust-panel>
+        <h3>本週提到的客戶</h3>
+        <div data-cust-list></div>
+        <div data-cust-records></div>
+        <button type="button" class="btn btn-sm" data-cust-add title="可先在欄位中選取客戶名稱，再按這裡">＋ 新增客戶到名錄</button>
+      </aside>` : ''}
+      </div>`, 'reports');
 
     const form = root.querySelector('[data-form]');
     form.addEventListener('input', () => { dirty = true; });
@@ -437,6 +616,7 @@
       form.querySelector('[data-week-label]').textContent = ws ? '本週報週次：' + weekLabel(ws) : '';
       if (ws) form.querySelectorAll('[data-day-label]').forEach((el) => { el.innerHTML = dayLabelHtml(ws, Number(el.dataset.dayLabel)); });
     });
+    if (me.department_id) bindCustomerPanel(form, report, allDepts, myCustomers);
     onSubmit(form, async (fd, action) => {
       const text = (k) => String(fd.get(k) || '').replace(/\r\n/g, '\n').trim();
       const submit = action === 'submit';
@@ -454,6 +634,62 @@
       setFlash('success', submit ? '週報已提交，等待主管查閱。' : '草稿已儲存。');
       go('/reports/' + newId);
     });
+  }
+
+  // 填寫週報旁的「本週提到的客戶」與輸入建議
+  function bindCustomerPanel(form, report, allDepts, customers) {
+    const fields = [...form.querySelectorAll('textarea[name^=day], textarea[name=customer_visits], textarea[name=work_summary]')];
+    const panel = root.querySelector('[data-cust-panel]');
+    const listEl = panel.querySelector('[data-cust-list]');
+    const recEl = panel.querySelector('[data-cust-records]');
+    let lastField = fields[0];
+    let selected = null;
+    const cache = new Map();
+    fields.forEach((f) => f.addEventListener('focus', () => { lastField = f; }));
+
+    const addCustomer = async (name) => {
+      const id = await customerDialog({ name, departments: addableDepts(allDepts) });
+      if (!id) return;
+      const fresh = await loadCustomers();
+      customers.splice(0, customers.length, ...fresh.filter((c) => c.department_id === me.department_id));
+      refresh();
+      if (lastField) lastField.focus();
+    };
+    const showRecords = async (c) => {
+      selected = c.id;
+      refresh();
+      recEl.innerHTML = '<p class="muted small">讀取中…</p>';
+      try {
+        if (!cache.has(c.id)) cache.set(c.id, must(await sb.rpc('customer_records', { p_customer_id: c.id, p_limit: 6, p_offset: 0 })));
+        const rows = cache.get(c.id).filter((r) => r.report_id !== report.id).slice(0, 5);
+        if (selected !== c.id) return;
+        recEl.innerHTML = `<h4>${esc(c.name)} 的過往紀錄</h4>
+          ${rows.length ? `<ul class="cust-records">${rows.map((r) => `<li>
+            <a href="#/reports/${r.report_id}" target="_blank" rel="noopener">${esc(recordDateLabel(r))}</a>
+            <span class="muted small">${esc(r.author_name || '')}</span>
+            <div class="snippet">${snippetHtml(r.content, termsOf(c), 30)}</div></li>`).join('')}</ul>`
+            : '<p class="muted small">還沒有已提交的週報提到這家客戶。</p>'}
+          <a class="small" href="#/customers?id=${c.id}" target="_blank" rel="noopener">查看全部紀錄</a>`;
+      } catch (e) {
+        recEl.innerHTML = `<p class="alert alert-error">${esc(e.message)}</p>`;
+      }
+    };
+    const refresh = () => {
+      const found = mentionedIn(fields.map((f) => f.value).join('\n'), customers);
+      if (selected && !found.some((c) => c.id === selected)) { selected = null; recEl.innerHTML = ''; }
+      listEl.innerHTML = found.length
+        ? `<ul class="cust-chips">${found.map((c) => `<li><button type="button" class="chip ${c.id === selected ? 'active' : ''}" data-cid="${c.id}">${esc(c.name)}</button></li>`).join('')}</ul>`
+        : `<p class="muted small">在工作內容或客戶拜訪紀錄寫到名錄中的客戶時，會列在這裡，點選可看過往紀錄。${customers.length ? '' : '<br>目前部門的客戶名錄還是空的。'}</p>`;
+      listEl.querySelectorAll('[data-cid]').forEach((b) => b.addEventListener('click', () => showRecords(customers.find((c) => c.id === Number(b.dataset.cid)))));
+    };
+    let timer = null;
+    fields.forEach((f) => f.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(refresh, 250); }));
+    panel.querySelector('[data-cust-add]').addEventListener('click', () => {
+      const sel = lastField ? lastField.value.slice(lastField.selectionStart, lastField.selectionEnd).trim() : '';
+      addCustomer(sel.length <= 100 ? sel : '');
+    });
+    attachCustomerSuggest(fields, () => customers, addCustomer);
+    refresh();
   }
 
   /* ------------------------------------------------------------------ 檢視週報 */
@@ -839,6 +1075,153 @@
     filters.addEventListener('submit', (e) => e.preventDefault());
   }
 
+  /* ------------------------------------------------------------------ 客戶 */
+  async function pageCustomers(query) {
+    const [customers, allDepts] = await Promise.all([loadCustomers(), sb.from('departments').select('id, name').order('name').then(must)]);
+    const deptName = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
+    const multiDept = new Set(customers.map((c) => c.department_id)).size > 1 || me.role !== 'staff';
+    const addable = addableDepts(allDepts);
+    const id = Number(query.get('id')) || 0;
+    const current = customers.find((c) => c.id === id) || null;
+    const label = (c) => esc(c.name) + (multiDept ? ` <span class="muted small">${esc(deptName[c.department_id] || '')}</span>` : '');
+    const stats = customers.length
+      ? must(await sb.rpc('customer_stats', { p_customer_ids: current ? [current.id] : customers.map((c) => c.id) }))
+      : [];
+    const sumBy = {};
+    for (const s of stats) {
+      const t = (sumBy[s.customer_id] = sumBy[s.customer_id] || { records: 0, last: '', people: [] });
+      t.records += Number(s.records);
+      if (s.last_date > t.last) t.last = s.last_date;
+      t.people.push(s);
+    }
+    const searchBox = `
+      <div class="cust-search" data-cust-search>
+        <label class="sr" for="cust-q">搜尋客戶</label>
+        <input id="cust-q" type="search" placeholder="輸入客戶名稱或別名" autocomplete="off" value="">
+        <div class="suggest cust-results" role="listbox" hidden></div>
+      </div>`;
+
+    if (id && !current) return errorPage('找不到客戶', '客戶不存在，或不在您可查看的部門。');
+
+    if (!current) {
+      layout(`
+        <div class="page-head">
+          <div><h1>客戶</h1><div class="muted">${me.role === 'admin' ? '全部部門' : me.role === 'manager' ? '所屬及負責部門' : esc(deptName[me.department_id] || '')}的客戶名錄，共 ${customers.length} 家</div></div>
+          ${addable.length ? '<button class="btn btn-primary" data-add>＋ 新增客戶</button>' : ''}
+        </div>
+        ${searchBox}
+        <section class="card">${!customers.length ? '<p class="muted center">名錄還是空的。按「新增客戶」加入第一家客戶，或在填寫週報時直接加入。</p>' : `
+          <div class="table-wrap"><table>
+            <thead><tr><th>客戶</th><th>別名</th><th class="num">紀錄次數</th><th>最後紀錄</th><th>狀態</th><th></th></tr></thead>
+            <tbody>${customers.map((c) => {
+              const t = sumBy[c.id] || { records: 0, last: '' };
+              return `<tr class="${c.active ? '' : 'inactive'}">
+                <td><a href="#/customers?id=${c.id}">${esc(c.name)}</a>${multiDept ? `<div class="muted small">${esc(deptName[c.department_id] || '')}</div>` : ''}</td>
+                <td class="small">${esc(c.aliases.join('、')) || '<span class="muted">—</span>'}</td>
+                <td class="num">${t.records}</td>
+                <td class="nowrap">${t.last ? t.last.replace(/-/g, '/') : '<span class="muted">—</span>'}</td>
+                <td>${c.active ? '使用中' : '<span class="badge badge-muted">停用</span>'}</td>
+                <td class="right">${canEditCustomer(c) ? `<button class="btn btn-sm" data-edit="${c.id}">編輯</button>` : ''}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table></div>`}
+        </section>
+        <p class="muted small">紀錄次數以「您看得到的已提交週報」計算：每日工作內容提到的每一天算 1 次；只寫在客戶拜訪紀錄的，該週算 1 次。</p>`, 'customers');
+    } else {
+      const t = sumBy[current.id] || { records: 0, last: '', people: [] };
+      t.people.sort((a, b) => Number(b.records) - Number(a.records));
+      layout(`
+        <div class="page-head">
+          <div>
+            <a href="#/customers" class="small">← 全部客戶</a>
+            <h1>${esc(current.name)} ${current.active ? '' : '<span class="badge badge-muted">停用</span>'}</h1>
+            <div class="muted">${esc(deptName[current.department_id] || '')}${current.aliases.length ? `，別名：${esc(current.aliases.join('、'))}` : ''}</div>
+          </div>
+          ${canEditCustomer(current) ? `<button class="btn" data-edit="${current.id}">編輯客戶</button>` : ''}
+        </div>
+        ${searchBox}
+        <div class="stats cust-stats">
+          <div class="stat"><span>${t.records}</span>紀錄次數</div>
+          <div class="stat"><span>${t.last ? t.last.replace(/-/g, '/') : '—'}</span>最後紀錄日期</div>
+          <div class="stat stat-people"><span>${t.people.length}</span>${t.people.length ? `接觸人員：${t.people.map((p) => `${esc(p.author_name || '—')} ${p.records}`).join('、')}` : '接觸人員'}</div>
+        </div>
+        <section class="card">
+          <ol class="cust-timeline" data-records></ol>
+          <p class="muted center" data-empty hidden>還沒有您看得到的已提交週報提到這家客戶。</p>
+          <div class="center"><button class="btn btn-sm" data-more hidden>載入更多</button></div>
+        </section>`, 'customers');
+
+      const list = root.querySelector('[data-records]');
+      const more = root.querySelector('[data-more]');
+      const back = '/customers?id=' + current.id;
+      let offset = 0;
+      const PAGE = 50;
+      const loadMore = async () => {
+        more.disabled = true;
+        const rows = must(await sb.rpc('customer_records', { p_customer_id: current.id, p_limit: PAGE, p_offset: offset }));
+        offset += rows.length;
+        list.insertAdjacentHTML('beforeend', rows.map((r) => `<li>
+          <div class="cust-rec-head"><strong>${esc(recordDateLabel(r))}</strong>
+            <span>${esc(r.author_name || '—')}</span><span class="muted small">${FIELD_LABELS[r.field] || ''}</span>
+            <a class="small" href="#/reports/${r.report_id}${qs({ back })}">開啟週報</a></div>
+          <div class="snippet">${snippetHtml(r.content, termsOf(current))}</div>
+        </li>`).join(''));
+        root.querySelector('[data-empty]').hidden = offset > 0;
+        more.hidden = rows.length < PAGE;
+        more.disabled = false;
+      };
+      more.addEventListener('click', () => loadMore().catch((e) => window.alert(e.message)));
+      await loadMore();
+    }
+
+    // 搜尋：輸入即列出符合的客戶（名稱或別名包含輸入文字）
+    const box = root.querySelector('[data-cust-search]');
+    const input = box.querySelector('input');
+    const results = box.querySelector('.cust-results');
+    let active = 0;
+    let hits = [];
+    const renderHits = () => {
+      results.innerHTML = hits.length
+        ? hits.map((c, i) => `<a class="suggest-item ${i === active ? 'active' : ''}" role="option" href="#/customers?id=${c.id}">
+            <strong>${label(c)}</strong>${c.aliases.length ? `<span class="muted small">別名：${esc(c.aliases.join('、'))}</span>` : ''}${c.active ? '' : ' <span class="badge badge-muted">停用</span>'}</a>`).join('')
+        : '<div class="suggest-item muted">找不到符合的客戶</div>';
+      results.hidden = false;
+    };
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase();
+      if (!q) { results.hidden = true; return; }
+      hits = customers.filter((c) => termsOf(c).some((term) => term.toLowerCase().includes(q))).slice(0, 8);
+      active = 0;
+      renderHits();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (results.hidden || !hits.length) return;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        active = (active + (e.key === 'ArrowDown' ? 1 : -1) + hits.length) % hits.length;
+        renderHits();
+      } else if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault();
+        go('/customers?id=' + hits[active].id);
+      } else if (e.key === 'Escape') {
+        results.hidden = true;
+      }
+    });
+    input.addEventListener('blur', () => setTimeout(() => { results.hidden = true; }, 150));
+
+    const reload = () => go('/customers' + (current ? '?id=' + current.id : ''));
+    const add = root.querySelector('[data-add]');
+    if (add) add.addEventListener('click', async () => {
+      const newId = await customerDialog({ departments: addable });
+      if (newId) { setFlash('success', '已加入客戶名錄。'); go('/customers?id=' + newId); }
+    });
+    root.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', async () => {
+      const c = customers.find((x) => x.id === Number(b.dataset.edit));
+      const saved = await customerDialog({ customer: c, departments: allDepts });
+      if (saved) { setFlash('success', `已更新客戶「${c.name}」。`); reload(); }
+    }));
+  }
+
   /* ------------------------------------------------------------------ 管理：部門 */
   async function pageDepartments() {
     if (me.role !== 'admin') return forbidden();
@@ -865,7 +1248,7 @@
               <td><form class="inline-form" data-rename="${d.id}"><input name="name" value="${esc(d.name)}" maxlength="50" required><button class="btn btn-sm">更名</button></form></td>
               <td><a href="#/admin/users?dept=${d.id}">${count} 人</a></td>
               <td>${esc(managers.join('、')) || '—'}</td>
-              <td class="right"><button class="btn btn-sm btn-danger-outline" data-del="${d.id}" data-confirm="確定刪除部門「${esc(d.name)}」？" ${count ? 'disabled title="部門仍有人員"' : ''}>刪除</button></td>
+              <td class="right"><button class="btn btn-sm btn-danger-outline" data-del="${d.id}" data-confirm="確定刪除部門「${esc(d.name)}」？該部門的客戶名錄也會一併刪除。" ${count ? 'disabled title="部門仍有人員"' : ''}>刪除</button></td>
             </tr>`;
           }).join('')}</tbody>
         </table></div>`}
@@ -999,6 +1382,7 @@
     [/^\/review$/, (m, q) => pageReview(q)],
     [/^\/print$/, (m, q) => pagePrint(q)],
     [/^\/stats$/, (m, q) => pageStats(q)],
+    [/^\/customers$/, (m, q) => pageCustomers(q)],
     [/^\/admin\/departments$/, pageDepartments],
     [/^\/admin\/users$/, (m, q) => pageUsers(q)],
     [/^\/admin\/users\/new$/, () => pageUserForm(null)],
