@@ -742,6 +742,20 @@ begin
 end;
 $$;
 
+-- 刪除客戶（僅系統管理員）。只刪除名錄資料；週報內容不受影響，紀錄是即時比對產生的
+create or replace function public.admin_delete_customer(p_id bigint)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not private.is_admin() then
+    raise exception '只有系統管理員可以刪除客戶。';
+  end if;
+  delete from public.customers where id = p_id;
+  if not found then
+    raise exception '客戶不存在。';
+  end if;
+end;
+$$;
+
 -- 客戶在週報中被提到的紀錄（以呼叫者身分執行，套用週報與人員的 RLS）
 --   每日工作內容提到：每一天算 1 筆，日期為那一天
 --   只在「客戶拜訪紀錄」或舊版「本週工作內容」提到：該週算 1 筆，日期為該週週一（day_index 為 null）
@@ -829,7 +843,7 @@ begin
     where n.nspname = 'public' and p.proname in (
       'save_report', 'delete_draft', 'change_my_password', 'review_report', 'review_reports',
       'admin_save_department', 'admin_delete_department', 'admin_save_user',
-      'save_customer', 'customer_mentions', 'customer_records', 'customer_stats')
+      'save_customer', 'customer_mentions', 'customer_records', 'customer_stats', 'admin_delete_customer')
   loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);

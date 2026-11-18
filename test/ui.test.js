@@ -177,6 +177,10 @@ function rpc(fn, args, uid) {
       db.customers.push({ id, department_id: args.p_department_id, name, aliases: args.p_aliases, active: true });
       return id;
     }
+    case 'admin_delete_customer':
+      if (me.role !== 'admin') throw new RpcError('只有系統管理員可以刪除客戶。');
+      db.customers = db.customers.filter((c) => c.id !== args.p_id);
+      return null;
     case 'customer_records':
       return mentions([args.p_customer_id], uid)
         .sort((a, b) => (a.record_date < b.record_date ? 1 : a.record_date > b.record_date ? -1 : b.report_id - a.report_id))
@@ -567,6 +571,7 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   assert.match(table, /大成科技[\s\S]*長興企業/);
   assert.doesNotMatch(table, /南方企業/, '看不到別部門的客戶');
   assert.strictEqual(await page.$$eval('[data-edit]', (b) => b.length), 2, '主管可編輯負責部門的客戶');
+  assert.strictEqual(await page.$('[data-del-cust]'), null, '主管不能刪除客戶');
 
   // 搜尋別名 → Enter 進入客戶頁
   await page.fill('#cust-q', '大成');
@@ -610,6 +615,22 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   await adm.goto(base + '#/customers');
   await adm.waitForSelector('h1:has-text("客戶")');
   assert.match(await adm.textContent('table'), /南方企業[\s\S]*南區業務部/);
+  // 系統管理員刪除客戶（確認後）
+  let confirmText = '';
+  adm.removeAllListeners('dialog');
+  adm.on('dialog', (d) => { confirmText = d.message(); d.accept(); });
+  await adm.click('[data-del-cust="2"]');
+  await adm.waitForSelector('.alert-success');
+  assert.match(confirmText, /確定刪除客戶「南方企業」[\s\S]*週報內容不會刪除/);
+  assert.match(await adm.textContent('.alert-success'), /已刪除客戶「南方企業」/);
+  assert.doesNotMatch(await adm.textContent('table'), /南方企業/);
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer'), [{ fn: 'admin_delete_customer', args: { p_id: 2 }, uid: U.admin }]);
+  // 取消確認時不會刪除
+  adm.removeAllListeners('dialog');
+  adm.on('dialog', (d) => d.dismiss());
+  await adm.click('[data-del-cust="1"]');
+  assert.strictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer').length, 1, '取消後沒有刪除');
+  assert.match(await adm.textContent('table'), /大成科技/);
   await adm.context().close();
 });
 
