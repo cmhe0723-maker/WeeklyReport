@@ -608,6 +608,216 @@ end;
 $$;
 
 -- =============================================================================
+-- 客戶名錄與客戶紀錄查詢
+--   * 每家客戶屬於一個部門；名稱與別名在同一部門內不可重複（不分大小寫）
+--   * 看得到名錄：自己所屬部門；主管另含負責的部門；系統管理員全部
+--   * 新增：看得到該部門名錄的人都可以新增；修改／停用：主管（負責部門）與系統管理員
+--   * 客戶紀錄：以名稱與別名即時比對「該部門人員」已提交週報的內容（舊週報也找得到）。
+--     查詢函式以呼叫者身分執行（security invoker），因此沿用週報的 RLS：
+--     業務只看到自己的、主管看到負責部門的、系統管理員看到全部。
+-- =============================================================================
+
+create table if not exists public.customers (
+  id            bigint generated always as identity primary key,
+  department_id bigint      not null references public.departments (id) on delete cascade,
+  name          text        not null check (char_length(btrim(name)) between 2 and 100),
+  aliases       text[]      not null default '{}' check (cardinality(aliases) <= 20),
+  active        boolean     not null default true,
+  created_by    uuid        references public.profiles (id) on delete set null,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+comment on table  public.customers         is '客戶名錄（依部門）';
+comment on column public.customers.aliases is '簡稱或別名，例如「大成」＝「大成科技」';
+create unique index if not exists customers_dept_name_key on public.customers (department_id, lower(name));
+
+drop trigger if exists customers_set_updated_at on public.customers;
+create trigger customers_set_updated_at
+  before update on public.customers
+  for each row execute function private.set_updated_at();
+
+-- 目前登入者的所屬部門（帳號停用時為 null）
+create or replace function private.my_dept()
+returns bigint language sql stable security definer set search_path = '' as $$
+  select p.department_id from public.profiles p where p.id = auth.uid() and p.active
+$$;
+
+-- 看得到（也可以新增）某部門的客戶名錄
+create or replace function private.can_view_customers(p_department_id bigint)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select private.my_role() is not null
+     and (private.can_review_dept(p_department_id) or p_department_id = private.my_dept())
+$$;
+
+-- 可以修改／停用某部門的客戶
+create or replace function private.can_edit_customers(p_department_id bigint)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select coalesce(private.my_role() in ('admin', 'manager'), false) and private.can_review_dept(p_department_id)
+$$;
+
+alter table public.customers enable row level security;
+drop policy if exists customers_select on public.customers;
+create policy customers_select on public.customers
+  for select to authenticated
+  using (private.can_view_customers(department_id));
+revoke all on public.customers from anon, authenticated;
+grant select on public.customers to authenticated;
+
+-- 新增（p_id 為 null）或修改客戶。業務人員只能新增；修改、停用需主管或系統管理員
+create or replace function public.save_customer(
+  p_id            bigint,
+  p_department_id bigint,
+  p_name          text,
+  p_aliases       text[],
+  p_active        boolean
+) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_old      public.customers;
+  v_terms    text[];
+  v_conflict record;
+  v_id       bigint;
+begin
+  if private.my_role() is null then
+    raise exception '沒有權限。';
+  end if;
+  p_name := btrim(coalesce(p_name, ''));
+  if char_length(p_name) < 2 or char_length(p_name) > 100 then
+    raise exception '客戶名稱需為 2–100 個字。';
+  end if;
+  -- 別名：去除空白與重複、移除與名稱相同者
+  p_aliases := array(
+    select a from (
+      select distinct on (lower(a)) a
+      from (select btrim(x) as a from unnest(coalesce(p_aliases, '{}'::text[])) as x) s
+      where a <> '' and lower(a) <> lower(p_name)
+      order by lower(a)
+    ) d order by a
+  );
+  if cardinality(p_aliases) > 20 then
+    raise exception '別名最多 20 個。';
+  end if;
+  if exists (select 1 from unnest(p_aliases) a where char_length(a) < 2 or char_length(a) > 50) then
+    raise exception '每個別名需為 2–50 個字（避免一個字的別名誤判）。';
+  end if;
+  if p_department_id is null or not exists (select 1 from public.departments where id = p_department_id) then
+    raise exception '請選擇客戶所屬的部門。';
+  end if;
+
+  if p_id is null then
+    if not private.can_view_customers(p_department_id) then
+      raise exception '您不能在這個部門新增客戶。';
+    end if;
+  else
+    select * into v_old from public.customers where id = p_id for update;
+    if not found or not private.can_view_customers(v_old.department_id) then
+      raise exception '客戶不存在。';
+    end if;
+    if not (private.can_edit_customers(v_old.department_id) and private.can_edit_customers(p_department_id)) then
+      raise exception '只有主管或系統管理員可以修改客戶名錄。';
+    end if;
+  end if;
+
+  v_terms := array(select lower(t) from unnest(array[p_name] || p_aliases) as t);
+  select c.name as customer_name, u.term into v_conflict
+  from public.customers c cross join lateral unnest(array[c.name] || c.aliases) as u(term)
+  where c.department_id = p_department_id and c.id is distinct from p_id and lower(u.term) = any (v_terms)
+  limit 1;
+  if found then
+    raise exception '「%」已經是客戶「%」的名稱或別名。', v_conflict.term, v_conflict.customer_name;
+  end if;
+
+  if p_id is null then
+    insert into public.customers (department_id, name, aliases, created_by)
+    values (p_department_id, p_name, p_aliases, auth.uid())
+    returning id into v_id;
+  else
+    update public.customers
+       set department_id = p_department_id, name = p_name, aliases = p_aliases,
+           active = coalesce(p_active, active)
+     where id = p_id
+    returning id into v_id;
+  end if;
+  return v_id;
+end;
+$$;
+
+-- 客戶在週報中被提到的紀錄（以呼叫者身分執行，套用週報與人員的 RLS）
+--   每日工作內容提到：每一天算 1 筆，日期為那一天
+--   只在「客戶拜訪紀錄」或舊版「本週工作內容」提到：該週算 1 筆，日期為該週週一（day_index 為 null）
+create or replace function public.customer_mentions(p_customer_ids bigint[])
+returns table (
+  customer_id bigint, report_id bigint, week_start date, day_index integer, record_date date,
+  field text, content text, author_id uuid, author_name text
+)
+language sql stable security invoker set search_path = '' as $$
+  with c as (
+    select cu.id, cu.department_id,
+           array(select lower(t) from unnest(array[cu.name] || cu.aliases) as t) as terms
+    from public.customers cu
+    where cu.id = any (p_customer_ids)
+  ),
+  r as (
+    select rp.id, rp.user_id, rp.week_start, rp.daily_work, rp.customer_visits, rp.work_summary,
+           p.name as author_name, p.department_id
+    from public.reports rp
+    join public.profiles p on p.id = rp.user_id
+    where rp.status = 'submitted' and p.department_id in (select department_id from c)
+  ),
+  entries as (
+    select r.id as report_id, r.user_id, r.author_name, r.department_id, r.week_start,
+           (d.i - 1)::integer as day_index, 'daily'::text as field, d.t as content, 0 as prio
+    from r cross join lateral jsonb_array_elements_text(r.daily_work) with ordinality as d(t, i)
+    where d.t <> ''
+    union all
+    select r.id, r.user_id, r.author_name, r.department_id, r.week_start, null, 'customer_visits', r.customer_visits, 1
+    from r where r.customer_visits <> ''
+    union all
+    select r.id, r.user_id, r.author_name, r.department_id, r.week_start, null, 'work_summary', r.work_summary, 2
+    from r where r.work_summary <> ''
+  ),
+  matched as (
+    select c.id as customer_id, e.*
+    from c join entries e on e.department_id = c.department_id
+    where exists (select 1 from unnest(c.terms) as t where strpos(lower(e.content), t) > 0)
+  ),
+  ranked as (
+    select m.*,
+           bool_or(m.field = 'daily') over (partition by m.customer_id, m.report_id) as has_daily,
+           row_number() over (partition by m.customer_id, m.report_id, (m.field = 'daily') order by m.prio) as rn
+    from matched m
+  )
+  select ranked.customer_id, ranked.report_id, ranked.week_start, ranked.day_index,
+         case when ranked.day_index is null then ranked.week_start else ranked.week_start + ranked.day_index end,
+         ranked.field, ranked.content, ranked.user_id, ranked.author_name
+  from ranked
+  where ranked.field = 'daily' or (not ranked.has_daily and ranked.rn = 1)
+$$;
+
+-- 單一客戶的紀錄，新到舊，分頁讀取
+create or replace function public.customer_records(p_customer_id bigint, p_limit integer default 50, p_offset integer default 0)
+returns table (
+  report_id bigint, week_start date, day_index integer, record_date date,
+  field text, content text, author_id uuid, author_name text
+)
+language sql stable security invoker set search_path = '' as $$
+  select m.report_id, m.week_start, m.day_index, m.record_date, m.field, m.content, m.author_id, m.author_name
+  from public.customer_mentions(array[p_customer_id]) as m
+  order by m.record_date desc, m.report_id desc, m.day_index desc nulls last
+  limit least(greatest(coalesce(p_limit, 50), 1), 200)
+  offset greatest(coalesce(p_offset, 0), 0)
+$$;
+
+-- 客戶紀錄統計：每位人員的紀錄次數與最後紀錄日期
+create or replace function public.customer_stats(p_customer_ids bigint[])
+returns table (customer_id bigint, author_id uuid, author_name text, records bigint, last_date date)
+language sql stable security invoker set search_path = '' as $$
+  select m.customer_id, m.author_id, m.author_name, count(*), max(m.record_date)
+  from public.customer_mentions(p_customer_ids) as m
+  group by m.customer_id, m.author_id, m.author_name
+$$;
+
+-- =============================================================================
 -- 函式權限：RPC 只開放給已登入者；內部函式不開放
 -- =============================================================================
 do $$
@@ -618,7 +828,8 @@ begin
     select p.oid::regprocedure from pg_proc p join pg_namespace n on n.oid = p.pronamespace
     where n.nspname = 'public' and p.proname in (
       'save_report', 'delete_draft', 'change_my_password', 'review_report', 'review_reports',
-      'admin_save_department', 'admin_delete_department', 'admin_save_user')
+      'admin_save_department', 'admin_delete_department', 'admin_save_user',
+      'save_customer', 'customer_mentions', 'customer_records', 'customer_stats')
   loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
@@ -634,7 +845,8 @@ end
 $$;
 -- RLS 政策會呼叫這些函式，因此登入者需要執行權限（函式本身只回傳自己的權限判斷）
 grant execute on function private.my_role(), private.is_admin(),
-                          private.can_review_dept(bigint), private.user_dept(uuid)
+                          private.can_review_dept(bigint), private.user_dept(uuid),
+                          private.my_dept(), private.can_view_customers(bigint)
   to authenticated;
 
 -- =============================================================================
