@@ -181,10 +181,14 @@ function rpc(fn, args, uid) {
       db.customers.push({ id, department_id: args.p_department_id, name, aliases: args.p_aliases, contacts: args.p_contacts || [], active: true });
       return id;
     }
-    case 'admin_delete_customer':
-      if (me.role !== 'admin') throw new RpcError('只有系統管理員可以刪除客戶。');
-      db.customers = db.customers.filter((c) => c.id !== args.p_id);
+    case 'admin_delete_customer': {
+      const c = visible('customers', uid).find((x) => x.id === args.p_id);
+      if (!c) throw new RpcError('客戶不存在。');
+      const canEdit = me.role === 'admin' || (me.role === 'manager' && db.manager_departments.some((m) => m.user_id === uid && m.department_id === c.department_id));
+      if (!canEdit) throw new RpcError('只有負責這個部門的主管或系統管理員可以刪除客戶。');
+      db.customers = db.customers.filter((x) => x.id !== args.p_id);
       return null;
+    }
     case 'customer_records':
       return mentions([args.p_customer_id], uid)
         .sort((a, b) => (a.record_date < b.record_date ? 1 : a.record_date > b.record_date ? -1 : b.report_id - a.report_id))
@@ -598,7 +602,15 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   assert.match(table, /大成科技[\s\S]*長興企業/);
   assert.doesNotMatch(table, /南方企業/, '看不到別部門的客戶');
   assert.strictEqual(await page.$$eval('[data-edit]', (b) => b.length), 2, '主管可編輯負責部門的客戶');
-  assert.strictEqual(await page.$('[data-del-cust]'), null, '主管不能刪除客戶');
+  assert.strictEqual(await page.$$eval('[data-del-cust]', (b) => b.length), 2, '主管可刪除負責部門的客戶');
+  // 主管刪除負責部門的客戶（確認後）
+  page.removeAllListeners('dialog');
+  page.on('dialog', (d) => d.accept());
+  await page.click('[data-del-cust="3"]');
+  await page.waitForSelector('.alert-success');
+  assert.match(await page.textContent('.alert-success'), /已刪除客戶「長興企業」/);
+  assert.doesNotMatch(await page.textContent('table'), /長興企業/);
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer'), [{ fn: 'admin_delete_customer', args: { p_id: 3 }, uid: U.boss }]);
 
   // 搜尋別名 → Enter 進入客戶頁
   await page.fill('#cust-q', '大成');
@@ -632,6 +644,7 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   await staff.goto(base + '#/customers');
   await staff.waitForSelector('h1:has-text("客戶")');
   assert.strictEqual(await staff.$('[data-edit]'), null);
+  assert.strictEqual(await staff.$('[data-del-cust]'), null, '業務不能刪除客戶');
   assert.ok(await staff.$('[data-add]'));
   await staff.goto(base + '#/customers?id=2');
   await staff.waitForSelector('h1:has-text("找不到客戶")'); // 別部門的客戶
@@ -652,12 +665,12 @@ test('客戶頁：搜尋、統計、紀錄與權限', async () => {
   assert.match(confirmText, /確定刪除客戶「南方企業」[\s\S]*週報內容不會刪除/);
   assert.match(await adm.textContent('.alert-success'), /已刪除客戶「南方企業」/);
   assert.doesNotMatch(await adm.textContent('table'), /南方企業/);
-  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer'), [{ fn: 'admin_delete_customer', args: { p_id: 2 }, uid: U.admin }]);
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer').at(-1), { fn: 'admin_delete_customer', args: { p_id: 2 }, uid: U.admin });
   // 取消確認時不會刪除
   adm.removeAllListeners('dialog');
   adm.on('dialog', (d) => d.dismiss());
   await adm.click('[data-del-cust="1"]');
-  assert.strictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer').length, 1, '取消後沒有刪除');
+  assert.strictEqual(rpcCalls.filter((c) => c.fn === 'admin_delete_customer').length, 2, '取消後沒有刪除');
   assert.match(await adm.textContent('table'), /大成科技/);
   await adm.context().close();
 });
