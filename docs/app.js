@@ -1159,7 +1159,7 @@
   }
 
   /* ------------------------------------------------------------------ 客戶 */
-  // 刪除客戶（系統管理員）：只刪名錄，週報內容不變
+  // 刪除客戶（負責該部門的主管、系統管理員）：只刪名錄，週報內容不變
   function delCustomerBtn(c, size) {
     const msg = `確定刪除客戶「${c.name}」？\n\n只會從客戶名錄移除，週報內容不會刪除；日後重新加入同名客戶，紀錄會再出現。\n若只是不想再出現在輸入建議，可改用「編輯」→ 取消「使用中」來停用。`;
     return `<button class="btn ${size} btn-danger-outline" data-del-cust="${c.id}" data-confirm="${esc(msg)}">刪除</button>`;
@@ -1210,7 +1210,7 @@
                 <td class="nowrap">${t.last ? t.last.replace(/-/g, '/') : '<span class="muted">—</span>'}</td>
                 <td>${c.active ? '使用中' : '<span class="badge badge-muted">停用</span>'}</td>
                 <td class="right nowrap">${canEditCustomer(c) ? `<button class="btn btn-sm" data-edit="${c.id}">編輯</button>` : ''}
-                  ${me.role === 'admin' ? delCustomerBtn(c, 'btn-sm') : ''}</td>
+                  ${canEditCustomer(c) ? delCustomerBtn(c, 'btn-sm') : ''}</td>
               </tr>`;
             }).join('')}</tbody>
           </table></div>`}
@@ -1229,7 +1229,7 @@
           </div>
           <div class="row-gap">
             ${canEditCustomer(current) ? `<button class="btn" data-edit="${current.id}">編輯客戶</button>` : ''}
-            ${me.role === 'admin' ? delCustomerBtn(current, '') : ''}
+            ${canEditCustomer(current) ? delCustomerBtn(current, '') : ''}
           </div>
         </div>
         ${searchBox}

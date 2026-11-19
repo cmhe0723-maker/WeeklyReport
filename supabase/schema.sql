@@ -845,17 +845,21 @@ begin
 end;
 $$;
 
--- 刪除客戶（僅系統管理員）。只刪除名錄資料；週報內容不受影響，紀錄是即時比對產生的
+-- 刪除客戶：負責該部門的主管與系統管理員（與修改權限相同）。
+-- 只刪除名錄資料；週報內容不受影響，紀錄是即時比對產生的
 create or replace function public.admin_delete_customer(p_id bigint)
 returns void language plpgsql security definer set search_path = '' as $$
+declare
+  v_dept bigint;
 begin
-  if not private.is_admin() then
-    raise exception '只有系統管理員可以刪除客戶。';
-  end if;
-  delete from public.customers where id = p_id;
-  if not found then
+  select department_id into v_dept from public.customers where id = p_id;
+  if not found or not private.can_view_customers(v_dept) then
     raise exception '客戶不存在。';
   end if;
+  if not private.can_edit_customers(v_dept) then
+    raise exception '只有負責這個部門的主管或系統管理員可以刪除客戶。';
+  end if;
+  delete from public.customers where id = p_id;
 end;
 $$;
 
