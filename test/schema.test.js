@@ -372,3 +372,43 @@ test('每日多筆拜訪：客戶、聯絡人、內容，聯絡人自動加入�
   await as(mgr, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true) as id", [cid, dept]);
   assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
 });
+
+test('週會紀錄：指定記錄人、草稿權限、版本衝突及發布', async () => {
+  const [{ id: colleague }] = await as(admin,
+    "select public.admin_save_user(null, 'meetingreader', '同部門人員', 'staff', $1, null, true, 'pass12345') as id", [d1]);
+  const attendees = [
+    { name: 'Amy', report: '第一段\n第二段', note: '個人附註' },
+    { name: '外部來賓', report: '', note: '' },
+  ];
+  const write = (uid, id, rev, publish, entries = attendees, recorder = amy, dept = d1) => as(uid,
+    "select public.save_meeting_minutes($1, $2, $3, '2026-11-20', $4, $5, '全場附註', $6) as id",
+    [id, rev, dept, recorder, JSON.stringify(entries), publish]);
+  const read = (uid, id) => as(uid, 'select * from meeting_minutes where id = $1', [id]);
+
+  await assert.rejects(write(amy, null, null, false), /沒有權限新增/);
+  await assert.rejects(write(boss, null, null, false, attendees, bob), /有效的記錄人/);
+  await assert.rejects(write(boss, null, null, true, []), /至少填寫一位/);
+  await assert.rejects(write(boss, null, null, false, [{ name: 'Amy' }]), /格式或長度/);
+  const [{ id }] = await write(boss, null, null, false);
+  assert.equal((await read(amy, id))[0].published_at, null);
+  assert.equal((await read(colleague, id)).length, 0);
+  assert.equal((await read(bob, id)).length, 0);
+  assert.equal((await as(amy, 'select * from meeting_roster($1, $2)', [d1, id])).some((p) => p.id === colleague), true);
+  assert.equal((await as(colleague, 'select * from meeting_roster($1, $2)', [d1, id])).length, 0);
+  await assert.rejects(as(null, 'select * from meeting_minutes'), /permission denied/);
+  await assert.rejects(as(amy, 'update meeting_minutes set notes = $1 where id = $2', ['x', id]), /permission denied/);
+  await assert.rejects(write(colleague, id, 1, false), /沒有權限編輯/);
+  await assert.rejects(write(amy, id, 1, true), /請由部門主管/);
+  await assert.rejects(write(amy, id, 1, false, attendees, colleague), /有效的記錄人/);
+
+  const reordered = [...attendees].reverse();
+  await write(amy, id, 1, false, reordered);
+  await assert.rejects(write(boss, id, 1, true), /已更新/);
+  await write(boss, id, 2, true, reordered);
+  const [published] = await read(colleague, id);
+  assert.ok(published.published_at);
+  assert.deepEqual(published.attendees, reordered);
+  assert.equal(published.notes, '全場附註');
+  assert.equal((await read(bob, id)).length, 0);
+  await assert.rejects(write(boss, id, 3, false), /已發布/);
+});

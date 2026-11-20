@@ -575,6 +575,9 @@ begin
   if exists (select 1 from public.profiles where department_id = p_id) then
     raise exception '此部門仍有人員，請先將人員移至其他部門。';
   end if;
+  if exists (select 1 from public.meeting_minutes where department_id = p_id) then
+    raise exception '此部門仍有週會紀錄，無法刪除。';
+  end if;
   delete from public.departments where id = p_id;
 end;
 $$;
@@ -938,6 +941,138 @@ language sql stable security invoker set search_path = '' as $$
   group by m.customer_id, m.author_id, m.author_name
 $$;
 
+-- 週會紀錄：與會者姓名依報告順序保存，保留會議當時的姓名。
+create table if not exists public.meeting_minutes (
+  id bigint generated always as identity primary key,
+  department_id bigint not null references public.departments (id),
+  meeting_date date not null,
+  recorder_id uuid references public.profiles (id) on delete set null,
+  recorder_name text not null,
+  attendees jsonb not null default '[]',
+  notes text not null default '',
+  published_at timestamptz,
+  revision integer not null default 1
+);
+create index if not exists meeting_minutes_department_date_idx
+  on public.meeting_minutes (department_id, meeting_date desc, id desc);
+
+alter table public.meeting_minutes enable row level security;
+drop policy if exists meeting_minutes_select on public.meeting_minutes;
+create policy meeting_minutes_select on public.meeting_minutes
+  for select to authenticated
+  using (
+    private.can_review_dept(department_id)
+    or (department_id = private.my_dept()
+        and (published_at is not null or recorder_id = (select auth.uid())))
+  );
+revoke all on public.meeting_minutes from anon, authenticated;
+grant select on public.meeting_minutes to authenticated;
+
+-- 只提供登打與會名單所需的姓名。記錄人限本人負責的草稿。
+create or replace function public.meeting_roster(p_department_id bigint, p_meeting_id bigint)
+returns table (id uuid, name text)
+language sql stable security definer set search_path = '' as $$
+  select p.id, p.name
+  from public.profiles p
+  where p.active and p.department_id = p_department_id
+    and (private.can_review_dept(p_department_id)
+         or (p_department_id = private.my_dept() and exists (
+           select 1 from public.meeting_minutes m
+           where m.id = p_meeting_id and m.department_id = p_department_id
+             and m.recorder_id = auth.uid() and m.published_at is null
+         )))
+  order by p.name, p.id
+$$;
+
+create or replace function public.save_meeting_minutes(
+  p_id bigint, p_revision integer, p_department_id bigint, p_meeting_date date,
+  p_recorder_id uuid, p_attendees jsonb, p_notes text, p_publish boolean
+) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_meeting public.meeting_minutes;
+  v_can_manage boolean := private.can_review_dept(p_department_id);
+  v_recorder_name text;
+  v_id bigint;
+begin
+  if p_id is null then
+    if not v_can_manage or p_department_id is null then
+      raise exception '您沒有權限新增此部門的週會紀錄。';
+    end if;
+  else
+    select * into v_meeting from public.meeting_minutes where id = p_id for update;
+    if not found or v_meeting.department_id is distinct from p_department_id
+       or not (v_can_manage or coalesce(
+         p_department_id = private.my_dept() and v_meeting.recorder_id = auth.uid(), false)) then
+      raise exception '您沒有權限編輯此週會紀錄。';
+    end if;
+    if v_meeting.published_at is not null then
+      raise exception '這份週會紀錄已發布。';
+    end if;
+    if v_meeting.revision is distinct from p_revision then
+      raise exception '這份週會紀錄已更新，請複製尚未儲存的內容，再重新開啟。';
+    end if;
+  end if;
+
+  if p_publish and not v_can_manage then
+    raise exception '請由部門主管或系統管理員發布。';
+  end if;
+  if p_id is not null and p_recorder_id is not distinct from v_meeting.recorder_id then
+    v_recorder_name := v_meeting.recorder_name;
+  elsif v_can_manage then
+    select p.name into v_recorder_name from public.profiles p
+    where p.id = p_recorder_id and p.active
+      and (p.department_id = p_department_id or p.id = auth.uid());
+  end if;
+  if v_recorder_name is null then
+    raise exception '請指定有效的記錄人。';
+  end if;
+  if p_meeting_date is null then
+    raise exception '請填寫會議日期。';
+  end if;
+  if jsonb_typeof(p_attendees) is distinct from 'array' then
+    raise exception '與會人員格式錯誤。';
+  end if;
+  if jsonb_array_length(p_attendees) > 100
+     or (p_publish and jsonb_array_length(p_attendees) = 0) then
+    raise exception '與會人員最多 100 位，發布前須至少填寫一位。';
+  end if;
+  if exists (
+    select 1 from jsonb_array_elements(p_attendees) a
+    where jsonb_typeof(a) is distinct from 'object'
+       or jsonb_typeof(a->'name') is distinct from 'string'
+       or char_length(btrim(a->>'name')) not between 1 and 50
+       or jsonb_typeof(a->'report') is distinct from 'string'
+       or char_length(a->>'report') > 10000
+       or jsonb_typeof(a->'note') is distinct from 'string'
+       or char_length(a->>'note') > 5000
+  ) or char_length(coalesce(p_notes, '')) > 10000 then
+    raise exception '請檢查姓名、報告內容及附註的格式或長度。';
+  end if;
+  -- 僅儲存表單欄位，陣列順序即發言順序。
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'name', btrim(a->>'name'), 'report', a->>'report', 'note', a->>'note'
+  ) order by ord), '[]'::jsonb) into p_attendees
+  from jsonb_array_elements(p_attendees) with ordinality as entries(a, ord);
+
+  if p_id is null then
+    insert into public.meeting_minutes
+      (department_id, meeting_date, recorder_id, recorder_name, attendees, notes, published_at)
+    values (p_department_id, p_meeting_date, p_recorder_id, v_recorder_name,
+            p_attendees, coalesce(p_notes, ''), case when p_publish then now() end)
+    returning id into v_id;
+  else
+    update public.meeting_minutes
+    set meeting_date = p_meeting_date, recorder_id = p_recorder_id,
+        recorder_name = v_recorder_name, attendees = p_attendees,
+        notes = coalesce(p_notes, ''), published_at = case when p_publish then now() end,
+        revision = revision + 1
+    where id = p_id returning id into v_id;
+  end if;
+  return v_id;
+end
+$$;
+
 -- =============================================================================
 -- 函式權限：RPC 只開放給已登入者；內部函式不開放
 -- =============================================================================
@@ -950,6 +1085,7 @@ begin
     where n.nspname = 'public' and p.proname in (
       'save_report', 'delete_draft', 'change_my_password', 'review_report', 'review_reports',
       'admin_save_department', 'admin_delete_department', 'admin_save_user',
+      'meeting_roster', 'save_meeting_minutes',
       'save_customer', 'customer_mentions', 'customer_records', 'customer_stats', 'admin_delete_customer')
   loop
     execute format('revoke all on function %s from public, anon', f);

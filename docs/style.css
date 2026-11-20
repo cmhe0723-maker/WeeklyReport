@@ -412,3 +412,16 @@ details.weekend .day-block:last-child { border-bottom: 0; }
 @media print {
   .entry-view { break-inside: avoid; }
 }
+
+/* ---------- 週會紀錄 ---------- */
+.meeting-attendee { border: 1px solid var(--rule-soft); border-radius: 6px; }
+.meeting-attendee summary { padding: .75rem 1rem; cursor: pointer; font-weight: 600; overflow-wrap: anywhere; }
+.meeting-attendee[open] > summary { border-bottom: 1px solid var(--rule-soft); }
+.meeting-attendee-body { padding: 1rem; }
+.meeting-attendee-actions { justify-content: flex-end; }
+form[data-meeting-form] > .card { margin-bottom: 0; }
+form[data-meeting-form] > [data-error]:empty { display: none; }
+@media (max-width: 560px) {
+  .nav { gap: 0 .9rem; flex-wrap: wrap; }
+  .nav a { min-height: 40px; }
+}

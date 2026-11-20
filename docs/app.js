@@ -396,6 +396,7 @@
         <nav class="nav">
           ${isWriter() ? navLink('/reports', '我的週報', section === 'reports') : ''}
           ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') + navLink('/stats', '繳交統計', section === 'stats') : ''}
+          ${navLink('/meetings', '週會紀錄', section === 'meetings')}
           ${navLink('/customers', '客戶', section === 'customers')}
           ${me.role === 'admin' ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
         </nav>
@@ -437,7 +438,7 @@
   function onSubmit(form, handler) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const buttons = form.querySelectorAll('button');
+      const buttons = form.querySelectorAll('button:not(:disabled)');
       buttons.forEach((b) => { b.disabled = true; });
       const box = form.querySelector('[data-error]');
       if (box) box.innerHTML = '';
@@ -1472,6 +1473,235 @@
     });
   }
 
+  /* ------------------------------------------------------------------ 週會紀錄 */
+  function canManageMeeting(dept) {
+    return me.role === 'admin' || (me.role === 'manager' && myManaged.includes(dept));
+  }
+  function departmentOptions(departments, selected) {
+    return departments.map((d) => `<option value="${d.id}" ${d.id === selected ? 'selected' : ''}>${esc(d.name)}</option>`).join('');
+  }
+  function meetingBadge(meeting) {
+    return meeting.published_at ? '<span class="badge badge-ok">已發布</span>' : badge('draft');
+  }
+  async function pageMeetings(query) {
+    const ticket = routing;
+    const visible = (id) => canManageMeeting(id) || id === me.department_id;
+    const departments = (await fetchAll(() => sb.from('departments').select('id, name').order('name').order('id'))).filter((d) => visible(d.id));
+    const managed = departments.filter((d) => canManageMeeting(d.id));
+    const dept = departments.find((d) => String(d.id) === query.get('dept'))?.id;
+    const week = weekStartOf(query.get('week'));
+    const meetings = await fetchAll(() => {
+      let request = sb.from('meeting_minutes')
+        .select('id, department_id, meeting_date, recorder_name, published_at')
+        .order('meeting_date', { ascending: false }).order('id', { ascending: false });
+      if (dept) request = request.eq('department_id', dept);
+      if (week) request = request.gte('meeting_date', week).lte('meeting_date', addDays(week, 6));
+      return request;
+    });
+    if (ticket !== routing) return;
+    const names = new Map(departments.map((d) => [d.id, d.name]));
+    layout(`
+      <div class="page-head">
+        <h1>週會紀錄</h1>
+        ${managed.length ? `<form class="inline-form" data-new-meeting>
+          <label>開會部門<select name="dept">${departmentOptions(managed, dept || me.department_id)}</select></label>
+          <button class="btn btn-primary">新增紀錄</button>
+        </form>` : ''}
+      </div>
+      <form class="card inline-form" data-meeting-filters>
+        <label>部門<select name="dept"><option value="">全部部門</option>${departmentOptions(departments, dept)}</select></label>
+        <label>週次（選該週任一天）<input type="date" name="week" value="${esc(week)}"></label>
+        <button class="btn">查詢</button>
+        <a class="btn" href="#/meetings">清除</a>
+      </form>
+      <section class="card">
+        ${meetings.length ? `<div class="table-wrap"><table>
+          <thead><tr><th>會議日期／週次</th><th>部門</th><th>記錄人</th><th>狀態</th></tr></thead>
+          <tbody>${meetings.map((m) => `<tr>
+            <td><a href="#/meetings/${m.id}">${esc(m.meeting_date)}</a><div class="muted small">${weekLabel(weekStartOf(m.meeting_date))}</div></td>
+            <td>${esc(names.get(m.department_id))}</td><td>${esc(m.recorder_name)}</td><td>${meetingBadge(m)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>` : '<p class="muted center">目前沒有符合條件的週會紀錄。</p>'}
+      </section>`, 'meetings');
+    root.querySelector('[data-new-meeting]')?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      go('/meetings/new' + qs({ dept: new FormData(e.target).get('dept') }));
+    });
+    root.querySelector('[data-meeting-filters]').addEventListener('submit', (e) => {
+      e.preventDefault();
+      go('/meetings' + qs(Object.fromEntries(new FormData(e.target))));
+    });
+  }
+
+  async function pageMeeting(id, dept) {
+    const ticket = routing;
+    const meeting = id ? must(await sb.from('meeting_minutes').select('*').eq('id', id).maybeSingle()) : {
+      department_id: dept, meeting_date: todayStr(), recorder_id: me.id, recorder_name: me.name,
+      attendees: [], notes: '', revision: null,
+    };
+    if (ticket !== routing) return;
+    if (!meeting) return errorPage('找不到週會紀錄', '紀錄不存在，或您沒有權限查看。');
+    const canManage = canManageMeeting(meeting.department_id);
+    if (!id && (!dept || !canManage)) return forbidden();
+    const department = must(await sb.from('departments').select('name').eq('id', meeting.department_id).maybeSingle());
+    if (ticket !== routing) return;
+    if (!department) return errorPage('找不到部門', '請返回週會紀錄列表。');
+
+    const back = '<a class="small" href="#/meetings">返回週會紀錄</a>';
+    if (meeting.published_at) {
+      layout(`
+        <div class="page-head"><div>${back}<h1>週會紀錄</h1></div>${meetingBadge(meeting)}</div>
+        <section class="card field-grid">
+          <div><strong>部門</strong><div>${esc(department.name)}</div></div>
+          <div><strong>會議日期／週次</strong><div>${esc(meeting.meeting_date)} · ${weekLabel(weekStartOf(meeting.meeting_date))}</div></div>
+          <div><strong>記錄人</strong><div>${esc(meeting.recorder_name)}</div></div>
+        </section>
+        <section class="card stack">
+          <h2>與會人員報告</h2>
+          ${meeting.attendees.map((a) => `<details class="meeting-attendee">
+            <summary>${esc(a.name)}</summary>
+            <div class="stack meeting-attendee-body">
+              <div><strong>報告內容</strong><div class="pre">${esc(a.report) || '—'}</div></div>
+              ${a.note ? `<div><strong>個人附註</strong><div class="pre">${esc(a.note)}</div></div>` : ''}
+            </div>
+          </details>`).join('')}
+        </section>
+        ${meeting.notes ? `<section class="card"><h2>全場附註</h2><div class="pre">${esc(meeting.notes)}</div></section>` : ''}`, 'meetings');
+      return;
+    }
+
+    const roster = must(await sb.rpc('meeting_roster', { p_department_id: meeting.department_id, p_meeting_id: id }));
+    if (ticket !== routing) return;
+    const recorders = new Map([[meeting.recorder_id, meeting.recorder_name], [me.id, me.name], ...roster.map((p) => [p.id, p.name])]);
+    layout(`
+      <div class="page-head"><div>${back}<h1>${id ? '編輯週會紀錄' : '新增週會紀錄'}</h1></div>${id ? meetingBadge(meeting) : ''}</div>
+      <form class="stack" data-meeting-form>
+        <div data-error role="alert"></div>
+        <section class="card stack">
+          <h2>會議基本資料</h2>
+          <div class="field-grid">
+            <div><strong>部門</strong><div>${esc(department.name)}</div></div>
+            <label>會議日期<input type="date" name="date" required value="${esc(meeting.meeting_date)}"></label>
+            <div><strong>週次</strong><div data-meeting-week>${weekLabel(weekStartOf(meeting.meeting_date))}</div></div>
+            ${canManage ? `<label>記錄人<select name="recorder">${[...recorders].map(([key, name]) =>
+              `<option value="${esc(key)}" ${key === meeting.recorder_id ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></label>`
+              : `<div><strong>記錄人</strong><div>${esc(meeting.recorder_name)}</div></div>`}
+          </div>
+        </section>
+        <section class="card stack">
+          <h2>與會人員報告</h2>
+          <div class="inline-form">
+            <label>部門人員<select data-roster><option value="">選擇人員</option>${roster.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('')}</select></label>
+            <button type="button" class="btn" data-add-person>加入人員</button>
+            <button type="button" class="btn" data-add-guest>加入臨時出席者</button>
+          </div>
+          <div class="stack" data-attendees></div>
+        </section>
+        <section class="card stack">
+          <label>全場附註（選填）<textarea name="notes" rows="4" maxlength="10000">${esc(meeting.notes)}</textarea></label>
+          <div class="actions">
+            <button class="btn ${canManage ? '' : 'btn-primary'}" value="draft">儲存草稿</button>
+            ${canManage ? '<button class="btn btn-primary" value="publish" data-confirm="確定發布？發布後將開放同部門人員查閱，並鎖定內容。">發布紀錄</button>' : ''}
+          </div>
+        </section>
+      </form>`, 'meetings');
+
+    const form = root.querySelector('[data-meeting-form]');
+    const entries = form.querySelector('[data-attendees]');
+    const rosterSelect = form.querySelector('[data-roster]');
+    const addPerson = form.querySelector('[data-add-person]');
+    const addGuest = form.querySelector('[data-add-guest]');
+    const date = form.elements.date;
+    const syncOrder = () => {
+      const rows = [...entries.children];
+      for (const [i, row] of rows.entries()) {
+        row.querySelector('[data-up]').disabled = i === 0;
+        row.querySelector('[data-down]').disabled = i === rows.length - 1;
+      }
+      addPerson.disabled = !rosterSelect.value || rows.length >= 100;
+      addGuest.disabled = rows.length >= 100;
+    };
+    function addAttendee(attendee, editing = false) {
+      const row = document.createElement('details');
+      row.className = 'meeting-attendee';
+      row.open = editing;
+      row.innerHTML = `
+        <summary>${esc(attendee.name || '臨時出席者')}</summary>
+        <div class="meeting-attendee-body stack">
+          <label>姓名<input name="attendee_name" maxlength="50" value="${esc(attendee.name)}"></label>
+          <label>報告內容<textarea name="report" rows="5" maxlength="10000">${esc(attendee.report)}</textarea></label>
+          <label>個人附註（選填）<textarea name="note" rows="2" maxlength="5000">${esc(attendee.note)}</textarea></label>
+          <div class="row-gap meeting-attendee-actions">
+            <button type="button" class="btn" data-up>上移</button>
+            <button type="button" class="btn" data-down>下移</button>
+            <button type="button" class="btn" data-remove>移除</button>
+          </div>
+        </div>`;
+      entries.append(row);
+      const name = row.querySelector('input');
+      name.addEventListener('input', () => { row.querySelector('summary').textContent = name.value.trim() || '臨時出席者'; });
+      row.querySelector('[data-up]').addEventListener('click', () => {
+        row.previousElementSibling?.before(row);
+        syncOrder();
+        dirty = true;
+        row.querySelector('summary').focus();
+      });
+      row.querySelector('[data-down]').addEventListener('click', () => {
+        row.nextElementSibling?.after(row);
+        syncOrder();
+        dirty = true;
+        row.querySelector('summary').focus();
+      });
+      row.querySelector('[data-remove]').addEventListener('click', () => {
+        if (!window.confirm('移除此人員及其報告內容？')) return;
+        row.remove();
+        syncOrder();
+        dirty = true;
+        rosterSelect.focus();
+      });
+      if (editing) {
+        (attendee.name ? row.querySelector('textarea') : name).focus();
+        dirty = true;
+      }
+    }
+    meeting.attendees.forEach((a) => addAttendee(a));
+    syncOrder();
+    rosterSelect.addEventListener('change', syncOrder);
+    addPerson.addEventListener('click', () => {
+      addAttendee({ name: roster[Number(rosterSelect.value)].name }, true);
+      rosterSelect.value = '';
+      syncOrder();
+    });
+    addGuest.addEventListener('click', () => {
+      addAttendee({}, true);
+      syncOrder();
+    });
+    date.addEventListener('input', () => {
+      form.querySelector('[data-meeting-week]').textContent = weekLabel(weekStartOf(date.value));
+    });
+    form.addEventListener('input', () => { dirty = true; });
+    root.querySelector('.page-head a').addEventListener('click', (e) => {
+      if (dirty && !window.confirm('尚未儲存，確定返回列表？')) e.preventDefault();
+    });
+    onSubmit(form, async (fd, action) => {
+      const attendees = [...entries.children].map((row) => ({
+        name: row.querySelector('[name=attendee_name]').value.trim(),
+        report: row.querySelector('[name=report]').value,
+        note: row.querySelector('[name=note]').value,
+      }));
+      if (attendees.some((a) => !a.name)) throw new Error('請填寫所有與會人員的姓名。');
+      const saved = must(await sb.rpc('save_meeting_minutes', {
+        p_id: id, p_revision: meeting.revision, p_department_id: meeting.department_id,
+        p_meeting_date: fd.get('date'), p_recorder_id: canManage ? fd.get('recorder') || null : meeting.recorder_id,
+        p_attendees: attendees, p_notes: fd.get('notes'), p_publish: action === 'publish',
+      }));
+      if (ticket !== routing) return;
+      dirty = false;
+      setFlash('success', action === 'publish' ? '已發布週會紀錄。' : '已儲存週會草稿。');
+      go('/meetings/' + saved);
+    });
+  }
+
   /* ------------------------------------------------------------------ 路由 */
   const routes = [
     [/^\/$/, () => go(me.role === 'staff' ? '/reports' : '/review')],
@@ -1483,6 +1713,9 @@
     [/^\/review$/, (m, q) => pageReview(q)],
     [/^\/print$/, (m, q) => pagePrint(q)],
     [/^\/stats$/, (m, q) => pageStats(q)],
+    [/^\/meetings$/, (m, q) => pageMeetings(q)],
+    [/^\/meetings\/new$/, (m, q) => pageMeeting(null, Number(q.get('dept')))],
+    [/^\/meetings\/(\d+)$/, (m) => pageMeeting(Number(m[1]))],
     [/^\/customers$/, (m, q) => pageCustomers(q)],
     [/^\/admin\/departments$/, pageDepartments],
     [/^\/admin\/users$/, (m, q) => pageUsers(q)],
