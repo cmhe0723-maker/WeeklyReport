@@ -56,6 +56,7 @@ const db = {
     },
   ],
   review_logs: [],
+  meeting_minutes: [],
   customers: [
     { id: 1, department_id: 1, name: '大成科技', aliases: ['大成'], contacts: ['林課長'], active: true },
     { id: 2, department_id: 2, name: '南方企業', aliases: [], contacts: [], active: true },
@@ -82,6 +83,8 @@ function visible(table, uid) {
     case 'manager_departments': return db.manager_departments.filter((m) => (m.user_id === uid && ok) || (ok && me.role === 'admin'));
     case 'reports': return db.reports.filter((r) => (r.user_id === uid && ok) || (r.status === 'submitted' && canReviewDept(uid, profileOf(r.user_id).department_id)))
       .map((r) => { const a = profileOf(r.user_id); return { ...r, author: { name: a.name, role: a.role, department_id: a.department_id, department: deptOf(a.department_id) } }; });
+    case 'meeting_minutes': return ok ? db.meeting_minutes.filter((m) => canReviewDept(uid, m.department_id)
+      || (me.department_id === m.department_id && (m.published_at || m.recorder_id === uid))) : [];
     case 'review_logs': return db.review_logs.filter((l) => visible('reports', uid).some((r) => r.id === l.report_id));
     // 與 schema.sql 相同：自己部門；主管另含負責部門；管理員全部
     case 'customers': return ok ? db.customers.filter((c) => me.role === 'admin' || c.department_id === me.department_id
@@ -188,6 +191,23 @@ function rpc(fn, args, uid) {
       if (!canEdit) throw new RpcError('只有負責這個部門的主管或系統管理員可以刪除客戶。');
       db.customers = db.customers.filter((x) => x.id !== args.p_id);
       return null;
+    }
+    case 'meeting_roster':
+      return db.profiles.filter((p) => p.active && p.department_id === args.p_department_id)
+        .map(({ id, name }) => ({ id, name }));
+    case 'save_meeting_minutes': {
+      const previous = db.meeting_minutes.find((m) => m.id === args.p_id);
+      const meeting = {
+        id: previous?.id ?? db.meeting_minutes.length + 1,
+        department_id: args.p_department_id, meeting_date: args.p_meeting_date,
+        recorder_id: args.p_recorder_id, recorder_name: profileOf(args.p_recorder_id).name,
+        attendees: args.p_attendees, notes: args.p_notes,
+        published_at: args.p_publish ? new Date().toISOString() : null,
+        revision: (previous?.revision ?? 0) + 1,
+      };
+      if (previous) Object.assign(previous, meeting);
+      else db.meeting_minutes.push(meeting);
+      return meeting.id;
     }
     case 'customer_records':
       return mentions([args.p_customer_id], uid)
@@ -720,6 +740,55 @@ test('手機版面不會水平捲動', async () => {
   assert.strictEqual(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
   await shot(page, 'd-report-mobile');
   await page.context().close();
+});
+
+test('週會紀錄：登打、調整順序、記錄人續編、發布與週次查詢', async () => {
+  const boss = await login('boss');
+  const amy = await login('amy');
+  try {
+    await boss.getByRole('link', { name: '週會紀錄', exact: true }).click();
+    await boss.getByRole('button', { name: '新增紀錄' }).click();
+    await boss.getByLabel('會議日期').fill(LAST_WEEK);
+    await boss.getByLabel('記錄人').selectOption(U.amy);
+    await boss.getByLabel('部門人員').selectOption({ label: '陳小明' });
+    await boss.getByRole('button', { name: '加入人員', exact: true }).click();
+    const entries = boss.locator('details.meeting-attendee');
+    await entries.first().getByLabel('報告內容').fill('第一段週會報告');
+    await boss.getByRole('button', { name: '加入臨時出席者' }).click();
+    await entries.last().getByLabel('姓名').fill('來賓');
+    await entries.last().getByLabel('個人附註').fill('來賓附註');
+    await entries.last().getByRole('button', { name: '上移' }).click();
+    await boss.getByLabel('全場附註').fill('共同公告');
+    await boss.getByRole('button', { name: '儲存草稿' }).click();
+    await boss.getByText('已儲存週會草稿。').waitFor();
+    const meetingUrl = boss.url();
+
+    await amy.goto(meetingUrl);
+    await amy.getByRole('heading', { name: '編輯週會紀錄' }).waitFor();
+    assert.equal(await amy.getByRole('button', { name: '發布紀錄' }).count(), 0);
+    await amy.locator('summary').filter({ hasText: '陳小明' }).click();
+    await amy.locator('details[open]').getByLabel('報告內容').fill('記錄人補登');
+    await amy.getByRole('button', { name: '儲存草稿' }).click();
+    await amy.getByText('已儲存週會草稿。').waitFor();
+
+    await boss.reload();
+    await boss.getByRole('button', { name: '發布紀錄' }).click();
+    await boss.getByText('已發布週會紀錄。').waitFor();
+    await amy.getByRole('link', { name: '返回週會紀錄' }).click();
+    await amy.getByLabel('週次（選該週任一天）').fill(THIS_WEEK);
+    await amy.getByRole('button', { name: '查詢', exact: true }).click();
+    await amy.getByText('目前沒有符合條件的週會紀錄。').waitFor();
+    await amy.getByLabel('週次（選該週任一天）').fill(addDaysStr(LAST_WEEK, 3));
+    await amy.getByRole('button', { name: '查詢', exact: true }).click();
+    await amy.getByRole('link', { name: LAST_WEEK }).click();
+    await amy.getByText('共同公告').waitFor();
+    assert.deepEqual(await amy.locator('summary').allTextContents(), ['來賓', '陳小明']);
+    await amy.locator('summary').filter({ hasText: '陳小明' }).click();
+    await amy.getByText('記錄人補登').waitFor();
+  } finally {
+    await boss.context().close();
+    await amy.context().close();
+  }
 });
 
 test('全程沒有 JavaScript 錯誤', () => {
