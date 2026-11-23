@@ -425,3 +425,36 @@ form[data-meeting-form] > [data-error]:empty { display: none; }
   .nav { gap: 0 .9rem; flex-wrap: wrap; }
   .nav a { min-height: 40px; }
 }
+
+/* ===== 逐級核閱：簽核欄 ===== */
+.doc-head { padding-right: 0; }
+.badge-info { background: var(--blue-wash); color: var(--blue); }
+.signoff { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin: -1rem 0 1.6rem; padding: .6rem 0 .8rem; border-bottom: 1px solid var(--rule); }
+.signoff-label { font-family: var(--serif); font-weight: 700; font-size: .95rem; color: var(--ink-soft); letter-spacing: .3em; writing-mode: vertical-rl; }
+.signoff-levels { list-style: none; margin: 0; padding: 0; display: flex; gap: .9rem; flex-wrap: wrap; align-items: center; }
+.signoff .seal { position: static; width: 5.2rem; height: 5.2rem; transform: rotate(-7deg); }
+.signoff .seal-top { font-size: .92rem; letter-spacing: .12em; padding-left: .12em; }
+.signoff .seal-date, .signoff .seal-name { font-size: .7rem; }
+.signoff .seal-name { max-width: 3.9rem; }
+.signoff .seal-fresh { animation: stamp-sm .42s cubic-bezier(.2, .9, .3, 1.2) both; }
+@keyframes stamp-sm {
+  0% { transform: rotate(-7deg) scale(1.6); opacity: 0; }
+  60% { transform: rotate(-7deg) scale(.94); opacity: .95; }
+  100% { transform: rotate(-7deg) scale(1); opacity: .9; }
+}
+@media (prefers-reduced-motion: reduce) { .signoff .seal-fresh { animation: none; } }
+.seal-empty { width: 5.2rem; height: 5.2rem; border-radius: 50%; border: 1.5px dashed #b9c3ca; color: var(--ink-soft);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .1rem; font-size: .85rem; }
+.seal-empty span { font-family: var(--serif); font-weight: 700; }
+.seal-empty small { font-size: .7rem; }
+.stamp-comments { list-style: none; margin: .5rem 0 0; padding: 0; font-size: .88rem; }
+.stamp-comments li { padding: .35rem 0; border-top: 1px dashed var(--rule-soft); }
+@media (max-width: 560px) {
+  .doc-head { padding-right: 0; }
+  .signoff .seal, .seal-empty { width: 4.4rem; height: 4.4rem; }
+  .signoff-label { writing-mode: horizontal-tb; letter-spacing: .1em; flex-basis: 100%; }
+}
+@media print {
+  .signoff { margin-top: 0; }
+  .seal-empty { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}

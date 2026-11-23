@@ -11,7 +11,7 @@
   });
   const root = document.getElementById('app');
   const TZ = cfg.timeZone || 'Asia/Taipei';
-  const ROLE_LABELS = { admin: '系統管理員', manager: '主管', staff: '業務人員' };
+  const ROLE_LABELS = { admin: '系統管理員', user: '一般人員' };
   // 每週欄位（「每日工作內容」另外處理）
   const FIELDS = [
     ['customer_visits', '客戶拜訪紀錄'],
@@ -21,7 +21,8 @@
   ];
 
   let me = null;          // 目前登入者 profile
-  let myManaged = [];     // 主管可查閱的部門 id
+  let myManaged = [];     // 額外可查閱的部門 id
+  let ranks = [];         // 職級（由高到低）
   let flash = null;       // 下一次畫面要顯示的訊息
   let dirty = false;      // 表單是否有未儲存變更
 
@@ -123,27 +124,54 @@
     const [y, m, d] = dateInTZ(iso).split('-');
     return `${Number(y) - 1911}.${m}.${d}`;
   }
-  // 主管查閱後蓋在週報上的日期章
+  // 逐級核閱的簽核欄：每個層級一個日期章，尚未核閱的層級顯示虛線圈
   let justReviewed = null;
-  function sealHtml(report) {
-    if (!report.reviewed_at) return '';
+  function levelsOf(report, st) {
+    if (st) return st.levels || [];
+    // 沒有核閱狀態時（例如只讀到週報本身）：已查閱就以最後查閱人顯示一個章
+    return report.reviewed_at ? [{ rank_name: '查閱', stamped: true, user_name: report.reviewer_name, created_at: report.reviewed_at }] : [];
+  }
+  function signoffHtml(report, st) {
+    const levels = levelsOf(report, st);
+    if (!levels.length || report.status !== 'submitted') return '';
     const fresh = justReviewed === report.id;
     if (fresh) justReviewed = null;
-    return `<div class="seal ${fresh ? 'seal-fresh' : ''}" role="img"
-      aria-label="${esc(`${report.reviewer_name || '主管'} 已於 ${fmtDateTime(report.reviewed_at)} 查閱`)}">
-      <span class="seal-top">已閱</span><span class="seal-date">${rocDate(report.reviewed_at)}</span><span class="seal-name">${esc(report.reviewer_name || '主管')}</span>
+    const lastStamped = levels.map((l) => l.stamped).lastIndexOf(true);
+    return `<div class="signoff" aria-label="核閱">
+      <span class="signoff-label">核閱</span>
+      <ol class="signoff-levels">${levels.map((l, i) => (l.stamped
+        ? `<li class="seal ${fresh && i === lastStamped ? 'seal-fresh' : ''}" role="img"
+             aria-label="${esc(`${l.admin ? '系統管理員' : l.rank_name} ${l.user_name || ''} 已於 ${fmtDateTime(l.created_at)} 核閱`)}"
+             title="${esc(l.comment ? '意見：' + l.comment : '')}">
+             <span class="seal-top">${esc(l.admin ? '代閱' : l.rank_name)}</span><span class="seal-date">${rocDate(l.created_at)}</span><span class="seal-name">${esc(l.user_name || '')}</span></li>`
+        : `<li class="seal-empty" aria-label="${esc(l.rank_name)} 尚未核閱"><span>${esc(l.rank_name)}</span><small>待核閱</small></li>`)).join('')}</ol>
     </div>`;
   }
+  // 讀取多份週報的核閱狀態 → Map(id → 狀態)
+  async function reviewStates(ids) {
+    const map = new Map();
+    const list = [...new Set(ids)].filter(Boolean);
+    for (let i = 0; i < list.length; i += 200) {
+      must(await sb.rpc('report_review_states', { p_ids: list.slice(i, i + 200) })).forEach((r) => map.set(r.report_id, r));
+    }
+    return map;
+  }
+  // 核閱進度文字，例：核閱中（1/3）
+  function progressText(st) {
+    if (!st) return '';
+    const done = st.levels.filter((l) => l.stamped).length;
+    return `${done}/${st.levels.length}`;
+  }
   // 週報內容（檢視頁與列印頁共用）
-  function reportBodyHtml(report, deptLabel) {
+  function reportBodyHtml(report, deptLabel, st) {
     return `
-      ${sealHtml(report)}
       <dl class="doc-head">
         <div><dt>週次</dt><dd>${weekLabel(report.week_start)}</dd></div>
         <div><dt>部門</dt><dd>${esc(deptLabel || '未分配部門')}</dd></div>
         <div><dt>提交</dt><dd>${report.submitted_at ? fmtDateTime(report.submitted_at) : '尚未提交'}</dd></div>
         <div><dt>最後更新</dt><dd>${fmtDateTime(report.updated_at)}</dd></div>
       </dl>
+      ${signoffHtml(report, st)}
       <h3>每日工作內容</h3>
       <div class="daily-view">${dailyEntriesOf(report).map((list, i) => (i < 5 || list.length ? `<div class="day-row">
         <div class="day-name">${esc(dayLabel(report.week_start, i))}</div>
@@ -153,15 +181,22 @@
       ${report.work_summary ? `<h3>本週工作內容</h3><div class="pre">${esc(report.work_summary)}</div>` : ''}
       ${FIELDS.map(([k, label]) => `<h3>${label}</h3><div class="pre ${report[k] ? '' : 'muted'}">${esc(report[k] || '（未填寫）')}</div>`).join('')}`;
   }
-  // 主管查閱狀態（不含操作表單）
-  function reviewStatusHtml(report) {
+  // 核閱狀態文字（不含操作表單）
+  function reviewStatusHtml(report, st) {
     if (report.status === 'draft') return '<p class="muted">草稿尚未提交，主管無法查看。</p>';
-    const comment = report.review_comment ? `<div class="pre comment">${esc(report.review_comment)}</div>` : '';
+    // 有逐級意見時逐級列出；否則（舊版週報）顯示單一意見
+    const stamped = st ? st.levels.filter((l) => l.stamped && l.comment) : [];
+    const comment = stamped.length
+      ? `<ul class="stamp-comments">${stamped.map((l) => `<li><strong>${esc(l.admin ? '系統管理員' : l.rank_name)}</strong> ${esc(l.user_name || '')}：${esc(l.comment)}</li>`).join('')}</ul>`
+      : report.review_comment ? `<div class="pre comment">${esc(report.review_comment)}</div>` : '';
     if (report.reviewed_at) {
-      return `<p><strong>✔ 已查閱完成</strong></p>
-        <p class="small">查閱人：${esc(report.reviewer_name || '—')}<br>查閱時間：${fmtDateTime(report.reviewed_at)}</p>${comment}`;
+      return `<p><strong>✔ 已完成核閱</strong></p>
+        <p class="small">最後核閱：${esc(report.reviewer_name || '—')}<br>完成時間：${fmtDateTime(report.reviewed_at)}</p>${comment}`;
     }
-    return `<p class="warn-text">⏳ 尚未查閱</p>${comment}`;
+    const next = st && st.next_rank_name;
+    const progress = st && st.levels.length ? `（${progressText(st)}）` : '';
+    return `<p class="warn-text">⏳ 核閱中${progress}</p>
+      <p class="small">${next ? `目前輪到：${esc(next)}` : '沒有其他可核閱的層級，請由系統管理員代為完成核閱。'}</p>${comment}`;
   }
   const PRINT_TIP = '在列印視窗的「目的地」選擇「另存為 PDF」，即可輸出 PDF 檔。';
   function printButton(label) {
@@ -187,11 +222,13 @@
     return customers.filter((c) => termsOf(c).some((term) => t.includes(term.toLowerCase())));
   }
   // 可以新增客戶的部門：業務＝自己部門；主管＝負責部門＋自己部門；系統管理員＝全部
+  // 可以新增客戶的部門：所屬部門＋額外可查閱部門；系統管理員全部
   function addableDepts(allDepts) {
-    if (me.role === 'admin') return allDepts;
-    return allDepts.filter((d) => d.id === me.department_id || (me.role === 'manager' && myManaged.includes(d.id)));
+    if (isAdmin()) return allDepts;
+    return allDepts.filter((d) => myScope().includes(d.id));
   }
-  const canEditCustomer = (c) => me.role === 'admin' || (me.role === 'manager' && myManaged.includes(c.department_id));
+  // 修改、停用、刪除：有主管權限的職級（所屬及額外可查閱部門）、系統管理員
+  const canEditCustomer = (c) => canManageDept(c.department_id);
   const escRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // 擷取提到客戶的那一段文字，並標示客戶名稱
   function snippetHtml(content, terms, radius = 45) {
@@ -216,7 +253,7 @@
   function customerDialog({ customer, name, departments }) {
     return new Promise((resolve) => {
       const editing = Boolean(customer);
-      const depts = editing && me.role !== 'admin' ? departments.filter((d) => myManaged.includes(d.id)) : departments;
+      const depts = editing && !isAdmin() ? departments.filter((d) => canManageDept(d.id)) : departments;
       const dlg = document.createElement('dialog');
       dlg.className = 'customer-dialog';
       dlg.innerHTML = `
@@ -346,8 +383,18 @@
   function safeBack(v) {
     return typeof v === 'string' && /^\/(review|stats|print|customers)(\?|$)/.test(v) ? v : null;
   }
+  // 他人週報在查閱名單上的狀態：mine＝輪到我核閱、progress＝核閱中、reviewed＝已查閱
+  function reviewRowState(r, st) {
+    const base = reportState(r);
+    if (base !== 'pending') return base;
+    if (st && (st.can_stamp || (st.is_admin && !st.complete))) return 'mine';
+    return 'progress';
+  }
   function badge(state) {
-    const [t, c] = { missing: ['未提交', 'muted'], draft: ['草稿', 'muted'], pending: ['待查閱', 'warn'], reviewed: ['已查閱', 'ok'] }[state];
+    const [t, c] = {
+      missing: ['未提交', 'muted'], draft: ['草稿', 'muted'], pending: ['待核閱', 'warn'], reviewed: ['已查閱', 'ok'],
+      mine: ['待我核閱', 'warn'], progress: ['核閱中', 'info'],
+    }[state];
     return `<span class="badge badge-${c}">${t}</span>`;
   }
   function toEmail(username) {
@@ -374,13 +421,17 @@
     const s = p.toString();
     return s ? '?' + s : '';
   }
-  const isWriter = () => me && (me.role === 'staff' || me.role === 'manager');
-  const isReviewer = () => me && (me.role === 'manager' || me.role === 'admin');
-  function canReview(report, authorDept) {
-    if (!report || report.status !== 'submitted' || report.user_id === me.id) return false;
-    if (me.role === 'admin') return true;
-    return me.role === 'manager' && myManaged.includes(authorDept);
-  }
+  const isAdmin = () => me && me.role === 'admin';
+  const isWriter = () => me && me.role === 'user';
+  // 有比自己低的職級（可能有下屬）或系統管理員，才顯示「週報查閱」「繳交統計」
+  const isReviewer = () => me && (isAdmin() || (me.rank && ranks.some((r) => r.seniority < me.rank.seniority)));
+  // 主管權限：管理客戶名錄、週會紀錄
+  const hasManagerRight = () => me && (isAdmin() || Boolean(me.rank && me.rank.is_manager));
+  // 涵蓋的部門：所屬部門＋額外可查閱部門
+  const myScope = () => [...new Set([me.department_id, ...myManaged].filter(Boolean))];
+  const canManageDept = (dept) => isAdmin() || (hasManagerRight() && myScope().includes(dept));
+  const rankLabel = (p) => (p.role === 'admin' ? '系統管理員' : (p.rank && p.rank.name) || '');
+  const rankOrder = (p) => (p.rank ? p.rank.seniority : -1e9);
 
   /* ------------------------------------------------------------------ 版面 */
   function navLink(href, label, active) {
@@ -398,10 +449,10 @@
           ${isReviewer() ? navLink('/review', '週報查閱', section === 'review') + navLink('/stats', '繳交統計', section === 'stats') : ''}
           ${navLink('/meetings', '週會紀錄', section === 'meetings')}
           ${navLink('/customers', '客戶', section === 'customers')}
-          ${me.role === 'admin' ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
+          ${isAdmin() ? navLink('/admin/users', '人員與權限', section === 'users') + navLink('/admin/ranks', '職級', section === 'ranks') + navLink('/admin/departments', '部門管理', section === 'departments') : ''}
         </nav>
         <div class="me">
-          <span class="me-name">${esc(me.name)}<small>${dept}${ROLE_LABELS[me.role]}</small></span>
+          <span class="me-name">${esc(me.name)}<small>${dept}${esc(rankLabel(me))}</small></span>
           <a href="#/password">變更密碼</a>
           <button class="link" data-logout>登出</button>
         </div>
@@ -482,11 +533,17 @@
     const { data } = await sb.auth.getSession();
     if (!data.session) return null;
     const profile = must(await sb.from('profiles')
-      .select('id, username, name, role, department_id, active, must_change_password, department:departments!profiles_department_id_fkey(name)')
+      .select('id, username, name, role, rank_id, department_id, active, must_change_password, department:departments!profiles_department_id_fkey(name), rank:ranks(id, name, seniority, is_manager)')
       .eq('id', data.session.user.id).maybeSingle());
     myManaged = [];
-    if (profile && profile.active && profile.role === 'manager') {
-      myManaged = must(await sb.from('manager_departments').select('department_id').eq('user_id', profile.id)).map((r) => r.department_id);
+    ranks = [];
+    if (profile && profile.active) {
+      const [md, rk] = await Promise.all([
+        sb.from('manager_departments').select('department_id').eq('user_id', profile.id),
+        sb.from('ranks').select('id, name, seniority, is_manager').order('seniority', { ascending: false }),
+      ]);
+      myManaged = must(md).map((r) => r.department_id);
+      ranks = must(rk);
     }
     return profile;
   }
@@ -519,6 +576,17 @@
     const reports = must(await sb.from('reports')
       .select('id, week_start, status, submitted_at, reviewed_at, reviewer_name, review_comment')
       .eq('user_id', me.id).order('week_start', { ascending: false }));
+    const states = await reviewStates(reports.filter((r) => r.status === 'submitted' && !r.reviewed_at).map((r) => r.id));
+    // 自己的週報：核閱中（已有章）顯示進度；有章後不能再編輯
+    const myState = (r) => {
+      const st = states.get(r.id);
+      return reportState(r) === 'pending' && st && st.levels.some((l) => l.stamped) ? 'progress' : reportState(r);
+    };
+    const stateHtml = (r) => {
+      const st = states.get(r.id);
+      return badge(myState(r)) + (st && st.levels.length ? ` <span class="muted small">${progressText(st)}</span>` : '');
+    };
+    const editable = (r) => !r.reviewed_at && myState(r) !== 'progress';
     const thisWeek = currentWeekStart();
     const cur = reports.find((r) => r.week_start === thisWeek);
     layout(`
@@ -531,20 +599,20 @@
       </div>
       <section class="card highlight"><div class="row-between">
         <div><div class="muted small">本週</div><strong>${weekLabel(thisWeek)}</strong></div>
-        ${cur ? `<div class="row-gap">${badge(reportState(cur))}<a class="btn" href="#/reports/${cur.id}">查看</a></div>`
+        ${cur ? `<div class="row-gap">${stateHtml(cur)}<a class="btn" href="#/reports/${cur.id}">查看</a></div>`
               : `<a class="btn btn-primary" href="#/reports/new?week=${thisWeek}">填寫本週週報</a>`}
       </div></section>
       <section class="card">
         ${!reports.length ? '<p class="muted center">尚未有任何週報。</p>' : `
         <div class="table-wrap"><table>
-          <thead><tr><th>週次</th><th>狀態</th><th>提交時間</th><th>主管查閱</th><th></th></tr></thead>
+          <thead><tr><th>週次</th><th>狀態</th><th>提交時間</th><th>主管核閱</th><th></th></tr></thead>
           <tbody>${reports.map((r) => `
             <tr>
               <td><a href="#/reports/${r.id}">${weekLabel(r.week_start)}</a></td>
-              <td>${badge(reportState(r))}</td>
+              <td class="nowrap">${stateHtml(r)}</td>
               <td class="nowrap">${fmtDateTime(r.submitted_at) || '—'}</td>
-              <td>${r.reviewed_at ? `${esc(r.reviewer_name || '—')} <span class="muted small">${fmtDateTime(r.reviewed_at)}</span>${r.review_comment ? `<div class="small comment-preview">💬 ${esc(r.review_comment)}</div>` : ''}` : '<span class="muted">—</span>'}</td>
-              <td class="nowrap right">${r.reviewed_at ? '' : `<a href="#/reports/${r.id}/edit">編輯</a>`}</td>
+              <td>${r.reviewed_at ? `${esc(r.reviewer_name || '—')} <span class="muted small">${fmtDateTime(r.reviewed_at)}</span>` : states.get(r.id) && states.get(r.id).next_rank_name ? `<span class="muted small">輪到 ${esc(states.get(r.id).next_rank_name)}</span>` : '<span class="muted">—</span>'}${r.review_comment ? `<div class="small comment-preview">💬 ${esc(r.review_comment)}</div>` : ''}</td>
+              <td class="nowrap right">${editable(r) ? `<a href="#/reports/${r.id}/edit">編輯</a>` : ''}</td>
             </tr>`).join('')}
           </tbody>
         </table></div>`}
@@ -562,8 +630,9 @@
     if (id) {
       report = must(await sb.from('reports').select('*').eq('id', id).eq('user_id', me.id).maybeSingle());
       if (!report) return notFound();
-      if (report.reviewed_at) {
-        setFlash('warning', '此週報主管已查閱，無法再修改。如需修改請洽主管撤回查閱。');
+      const st = report.status === 'submitted' ? (await reviewStates([report.id])).get(report.id) : null;
+      if (report.reviewed_at || (st && st.levels.some((l) => l.stamped))) {
+        setFlash('warning', '此週報已有主管核閱，無法再修改。如需修改請洽主管撤回核閱。');
         return go('/reports/' + id);
       }
     } else {
@@ -696,7 +765,7 @@
         p_issues: text('issues'), p_submit: submit,
       }));
       dirty = false;
-      setFlash('success', submit ? '週報已提交，等待主管查閱。' : '草稿已儲存。');
+      setFlash('success', submit ? '週報已提交，等待主管核閱。' : '草稿已儲存。');
       go('/reports/' + newId);
     });
   }
@@ -785,10 +854,23 @@
     const logs = must(await sb.from('review_logs').select('action, comment, user_name, created_at').eq('report_id', id).order('id', { ascending: false }));
     const isOwner = report.user_id === me.id;
     const author = report.author || {};
-    const reviewable = canReview(report, author.department_id);
+    const st = report.status === 'submitted' ? (await reviewStates([report.id])).get(report.id) : null;
     const back = safeBack(query.get('back')) || (isOwner ? '/reports' : '/review');
-    const state = reportState(report);
-    const L = { reviewed: '標記查閱完成', unreviewed: '撤回查閱', commented: '更新意見' };
+    // 作者自己看：已有章就是「核閱中」；他人看：是否輪到自己
+    const state = isOwner
+      ? (reportState(report) === 'pending' && st && st.levels.some((l) => l.stamped) ? 'progress' : reportState(report))
+      : reviewRowState(report, st);
+    const locked = Boolean(report.reviewed_at || (st && st.levels.some((l) => l.stamped)));
+    const L = { reviewed: '核閱', unreviewed: '撤回核閱', commented: '更新意見' };
+    const myRankName = me.rank ? me.rank.name : '';
+    // 可執行的核閱動作（由資料庫判斷，這裡只決定顯示哪些按鈕）
+    const actions = st ? [
+      st.can_stamp && `<button class="btn btn-primary" value="review">✔ 核閱（${esc(myRankName)}）</button>`,
+      st.is_admin && !st.complete && '<button class="btn btn-primary" value="review" data-confirm="以系統管理員身分代為完成核閱？未核閱的層級將不再需要核閱。">代為完成核閱</button>',
+      st.can_withdraw && '<button class="btn" value="comment">更新我的意見</button>',
+      st.can_withdraw && '<button class="btn btn-danger-outline" value="unreview" data-confirm="確定撤回您的核閱？">撤回我的核閱</button>',
+      st.is_admin && st.levels.some((l) => l.stamped) && '<button class="btn btn-danger-outline" value="unreview" data-confirm="撤回這份週報的全部核閱？撤回後作者可再次修改。">撤回全部核閱</button>',
+    ].filter(Boolean) : [];
 
     layout(`
       <div class="page-head">
@@ -797,26 +879,24 @@
           <h1>${esc(author.name || me.name)} 的週報 ${badge(state)}</h1>
         </div>
         <div class="row-gap no-print">
-          ${isOwner && !report.reviewed_at ? `<a class="btn" href="#/reports/${report.id}/edit">編輯</a>
+          ${isOwner && !locked ? `<a class="btn" href="#/reports/${report.id}/edit">編輯</a>
             ${report.status === 'draft' ? '<button class="btn btn-danger" data-delete data-confirm="確定刪除這份草稿？">刪除</button>' : ''}` : ''}
           ${printButton()}
         </div>
       </div>
       <div class="grid-2">
-        <section class="card sheet report-body">${reportBodyHtml(report, author.department && author.department.name)}</section>
+        <section class="card sheet report-body">${reportBodyHtml(report, author.department && author.department.name, st)}</section>
         <aside class="stack">
           <section class="card review-box ${report.reviewed_at ? 'is-reviewed' : ''}">
-            <h3>主管查閱</h3>
-            ${reviewStatusHtml(report)}
-            ${reviewable ? `<form class="stack" data-review>
+            <h3>主管核閱</h3>
+            ${reviewStatusHtml(report, st)}
+            ${actions.length ? `<form class="stack" data-review>
               <div data-error></div>
-              <label>主管意見（選填）<textarea name="comment" rows="4" maxlength="2000">${esc(report.review_comment)}</textarea></label>
-              ${report.reviewed_at
-                ? '<button class="btn" value="comment">更新意見</button><button class="btn btn-danger-outline" value="unreview" data-confirm="撤回後業務人員可再次修改此週報，確定撤回？">撤回查閱</button>'
-                : '<button class="btn btn-primary" value="review">✔ 標記為查閱完成</button><button class="btn" value="comment">僅儲存意見</button>'}
+              <label>核閱意見（選填）<textarea name="comment" rows="3" maxlength="2000"></textarea></label>
+              ${actions.join('')}
             </form>` : ''}
           </section>
-          ${logs.length ? `<section class="card review-log"><h3>查閱紀錄</h3><ul class="timeline">
+          ${logs.length ? `<section class="card review-log"><h3>核閱紀錄</h3><ul class="timeline">
             ${logs.map((l) => `<li><span class="small muted">${fmtDateTime(l.created_at)}</span><br>${esc(l.user_name || '—')} ${L[l.action]}${l.comment ? `：<span class="muted">${esc(l.comment)}</span>` : ''}</li>`).join('')}
           </ul></section>` : ''}
         </aside>
@@ -834,7 +914,7 @@
     if (form) onSubmit(form, async (fd, action) => {
       must(await sb.rpc('review_report', { p_id: report.id, p_action: action, p_comment: String(fd.get('comment') || '') }));
       if (action === 'review') justReviewed = report.id;
-      setFlash('success', { review: '已標記為「查閱完成」。', unreview: '已撤回查閱狀態，業務人員可再次修改。', comment: '主管意見已更新。' }[action]);
+      setFlash('success', { review: '已完成核閱。', unreview: '已撤回核閱。', comment: '核閱意見已更新。' }[action]);
       go(`/reports/${report.id}${qs({ back: query.get('back') })}`);
     });
   }
@@ -842,64 +922,71 @@
   /* ------------------------------------------------------------------ 週報查閱 */
   async function pageReview(query) {
     if (!isReviewer()) return forbidden();
-    const allDepts = must(await sb.from('departments').select('id, name').order('name'));
-    const departments = me.role === 'admin' ? allDepts : allDepts.filter((d) => myManaged.includes(d.id));
-    const deptName = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
-    const deptIds = departments.map((d) => d.id);
+    const { departments, deptName, deptFilter, scopeIds } = await reviewScope(query);
     const thisWeek = currentWeekStart();
     const weekParam = query.has('week') ? query.get('week') : thisWeek;
     const week = weekParam === 'all' ? null : (weekStartOf(weekParam) || thisWeek);
-    const deptFilter = Number(query.get('dept')) || 0;
-    const status = ['pending', 'reviewed', 'missing'].includes(query.get('status')) ? query.get('status') : 'all';
-    const scopeIds = deptFilter && deptIds.includes(deptFilter) ? [deptFilter] : deptIds;
+    // 狀態：mine＝待我核閱、progress＝核閱中（含待我核閱）、reviewed＝已查閱、missing＝未提交
+    const status = ['mine', 'progress', 'reviewed', 'missing'].includes(query.get('status')) ? query.get('status') : 'all';
     const backUrl = '/review' + qs({ week: week || 'all', dept: deptFilter || '', status });
     const link = (o) => '#/review' + qs({ week: week || 'all', dept: deptFilter || '', status, ...o });
 
-    const pending = await sb.from('reports').select('id', { count: 'exact', head: true })
-      .eq('status', 'submitted').is('reviewed_at', null).neq('user_id', me.id);
-    must(pending);
-    const pendingTotal = pending.count || 0;
+    // 待我核閱（所有週次）
+    const openReports = await fetchAll(() => sb.from('reports').select('id')
+      .eq('status', 'submitted').is('reviewed_at', null).neq('user_id', me.id).order('id'));
+    const openStates = await reviewStates(openReports.map((r) => r.id));
+    const myTurn = [...openStates.values()].filter((st) => st.can_stamp || (st.is_admin && !st.complete)).length;
 
+    const author = 'author:profiles!reports_user_id_fkey!inner(name, role, department_id, rank:ranks(name, seniority))';
     let rows = [];
     let summary = null;
     if (scopeIds.length && week) {
-      const people = must(await sb.from('profiles').select('id, name, role, department_id')
-        .eq('active', true).in('role', ['staff', 'manager']).neq('id', me.id).in('department_id', scopeIds));
+      // 看得到的人員（依職級，由資料庫 RLS 決定）
+      const people = must(await sb.from('profiles').select('id, name, role, department_id, rank:ranks(name, seniority)')
+        .eq('active', true).eq('role', 'user').neq('id', me.id).in('department_id', scopeIds));
       const reports = must(await sb.from('reports')
-        .select('id, user_id, status, submitted_at, reviewed_at, reviewer_name, work_summary, daily_work').eq('week_start', week));
+        .select('id, user_id, week_start, status, submitted_at, reviewed_at, reviewer_name, work_summary, daily_work').eq('week_start', week));
+      const states = await reviewStates(reports.filter((r) => r.status === 'submitted').map((r) => r.id));
       const byUser = Object.fromEntries(reports.map((r) => [r.user_id, r]));
       rows = people.map((p) => {
         const r = byUser[p.id] || {};
-        return { ...r, author_name: p.name, role: p.role, department_name: deptName[p.department_id] || '—', state: reportState(r) };
+        const st = states.get(r.id);
+        return { ...r, st, author_name: p.name, rank: p.rank, department_id: p.department_id, department_name: deptName[p.department_id] || '—', state: reviewRowState(r, st) };
       }).map((r) => (r.state === 'draft' ? { ...r, state: 'missing', id: null } : r));
-      rows.sort((a, b) => a.department_name.localeCompare(b.department_name, 'zh-Hant')
-        || (a.role === b.role ? 0 : a.role === 'staff' ? -1 : 1) || a.author_name.localeCompare(b.author_name, 'zh-Hant'));
       summary = {
         total: rows.length,
         missing: rows.filter((r) => r.state === 'missing').length,
-        pending: rows.filter((r) => r.state === 'pending').length,
+        progress: rows.filter((r) => r.state === 'mine' || r.state === 'progress').length,
+        mine: rows.filter((r) => r.state === 'mine').length,
         reviewed: rows.filter((r) => r.state === 'reviewed').length,
       };
-      if (status !== 'all') rows = rows.filter((r) => r.state === status);
     } else if (scopeIds.length && status !== 'missing') {
       let q = sb.from('reports')
-        .select('id, user_id, week_start, status, reviewed_at, reviewer_name, work_summary, daily_work, author:profiles!reports_user_id_fkey!inner(name, role, department_id)')
+        .select(`id, user_id, week_start, status, reviewed_at, reviewer_name, work_summary, daily_work, ${author}`)
         .eq('status', 'submitted').neq('user_id', me.id).in('author.department_id', scopeIds)
         .order('week_start', { ascending: false }).limit(500);
-      if (status === 'pending') q = q.is('reviewed_at', null);
       if (status === 'reviewed') q = q.not('reviewed_at', 'is', null);
-      rows = must(await q).map((r) => ({
-        ...r, author_name: r.author.name, role: r.author.role, department_name: deptName[r.author.department_id] || '—', state: reportState(r),
-      }));
+      if (status === 'mine' || status === 'progress') q = q.is('reviewed_at', null);
+      const list = must(await q);
+      const states = await reviewStates(list.filter((r) => !r.reviewed_at).map((r) => r.id));
+      rows = list.map((r) => {
+        const st = states.get(r.id);
+        return { ...r, st, author_name: r.author.name, rank: r.author.rank, department_id: r.author.department_id, department_name: deptName[r.author.department_id] || '—', state: reviewRowState(r, st) };
+      });
     }
+    if (status === 'progress') rows = rows.filter((r) => r.state === 'mine' || r.state === 'progress');
+    else if (status !== 'all') rows = rows.filter((r) => r.state === status);
+    if (week) rows.sort((a, b) => a.department_name.localeCompare(b.department_name, 'zh-Hant')
+      || rankOrder(b) - rankOrder(a) || a.author_name.localeCompare(b.author_name, 'zh-Hant'));
+    const printable = summary ? summary.progress + summary.reviewed : 0;
 
     const opt = (v, label, cur) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
     layout(`
       <div class="page-head">
         <h1>週報查閱</h1>
-        <a class="pending-pill ${pendingTotal ? '' : 'zero'}" href="#/review?week=all&status=pending">全部待查閱：<strong>${pendingTotal}</strong> 份</a>
+        <a class="pending-pill ${myTurn ? '' : 'zero'}" href="#/review?week=all&status=mine">待我核閱：<strong>${myTurn}</strong> 份</a>
       </div>
-      ${!departments.length ? '<div class="alert alert-warning">您目前沒有被指派任何可查閱的部門，請洽系統管理員設定。</div>' : ''}
+      ${!departments.length ? '<div class="alert alert-warning">您目前沒有所屬部門或可查閱的部門，請洽系統管理員設定。</div>' : ''}
       <form class="card filters" data-filters>
         <div class="week-nav">
           ${week ? `<a class="btn btn-sm" href="${link({ week: addDays(week, -7) })}">‹ 上週</a>` : ''}
@@ -911,18 +998,18 @@
         <div class="row-gap">
           <select name="dept">${opt('', '全部部門', deptFilter || '')}${departments.map((d) => opt(d.id, esc(d.name), deptFilter)).join('')}</select>
           <select name="status">
-            ${opt('all', '全部狀態', status)}${opt('pending', '待查閱', status)}${opt('reviewed', '已查閱', status)}${week ? opt('missing', '未提交', status) : ''}
+            ${opt('all', '全部狀態', status)}${opt('mine', '待我核閱', status)}${opt('progress', '核閱中', status)}${opt('reviewed', '已查閱', status)}${week ? opt('missing', '未提交', status) : ''}
           </select>
         </div>
       </form>
       ${week ? `<div class="row-between section-title-row">
           <h2 class="section-title">${weekLabel(week)}</h2>
-          ${summary && summary.pending + summary.reviewed ? `<a class="btn btn-sm" href="#/print${qs({ week, dept: deptFilter || '', status: status === 'pending' || status === 'reviewed' ? status : '' })}">🖨 列印本週週報（${status === 'pending' ? summary.pending : status === 'reviewed' ? summary.reviewed : summary.pending + summary.reviewed} 份）</a>` : ''}
+          ${printable ? `<a class="btn btn-sm" href="#/print${qs({ week, dept: deptFilter || '', status: status === 'reviewed' ? 'reviewed' : status === 'mine' || status === 'progress' ? 'pending' : '' })}">🖨 列印本週週報</a>` : ''}
         </div>
         <div class="stats">
           <div class="stat"><span>${summary ? summary.total : 0}</span>應填人數</div>
           <div class="stat stat-muted"><span>${summary ? summary.missing : 0}</span>未提交</div>
-          <div class="stat stat-warn"><span>${summary ? summary.pending : 0}</span>待查閱</div>
+          <div class="stat stat-warn"><span>${summary ? summary.progress : 0}</span>核閱中${summary && summary.mine ? `（待我核閱 ${summary.mine}）` : ''}</div>
           <div class="stat stat-ok"><span>${summary ? summary.reviewed : 0}</span>已查閱</div>
         </div>` : '<h2 class="section-title">所有週次已提交週報</h2>'}
       <form class="card" data-batch>
@@ -930,25 +1017,26 @@
         ${!rows.length ? '<p class="muted center">沒有符合條件的資料。</p>' : `
         <div class="table-wrap"><table>
           <thead><tr>
-            <th class="check"><input type="checkbox" data-check-all title="全選待查閱"></th>
-            ${week ? '' : '<th>週次</th>'}<th>部門</th><th>姓名</th><th>狀態</th><th>內容摘要</th><th>查閱</th><th></th>
+            <th class="check"><input type="checkbox" data-check-all title="全選待我核閱"></th>
+            ${week ? '' : '<th>週次</th>'}<th>部門</th><th>姓名</th><th>狀態</th><th>內容摘要</th><th>核閱</th><th></th>
           </tr></thead>
           <tbody>${rows.map((r) => {
-            const visible = r.state === 'pending' || r.state === 'reviewed';
+            const visible = r.state !== 'missing' && r.state !== 'draft';
             const sum = workPreview(r);
             return `<tr class="state-${r.state}">
-              <td class="check">${r.state === 'pending' ? `<input type="checkbox" name="ids" value="${r.id}">` : ''}</td>
+              <td class="check">${r.state === 'mine' ? `<input type="checkbox" name="ids" value="${r.id}">` : ''}</td>
               ${week ? '' : `<td class="nowrap">${weekLabel(r.week_start)}</td>`}
               <td class="nowrap">${esc(r.department_name)}</td>
-              <td class="nowrap">${esc(r.author_name)}${r.role === 'manager' ? ' <span class="tag">主管</span>' : ''}</td>
-              <td>${badge(r.state)}</td>
+              <td class="nowrap">${esc(r.author_name)}${r.rank ? ` <span class="tag">${esc(r.rank.name)}</span>` : ''}</td>
+              <td class="nowrap">${badge(r.state)}${r.st && !r.st.complete && r.st.levels.length ? ` <span class="muted small">${progressText(r.st)}</span>` : ''}</td>
               <td class="summary">${visible ? esc(sum.slice(0, 60)) + (sum.length > 60 ? '…' : '') : '<span class="muted">—</span>'}</td>
-              <td class="nowrap small">${r.reviewed_at ? `${esc(r.reviewer_name || '—')}<br><span class="muted">${fmtDateTime(r.reviewed_at)}</span>` : '<span class="muted">—</span>'}</td>
+              <td class="nowrap small">${r.reviewed_at ? `${esc(r.reviewer_name || '—')}<br><span class="muted">${fmtDateTime(r.reviewed_at)}</span>`
+                : r.st && r.st.next_rank_name ? `<span class="muted">輪到 ${esc(r.st.next_rank_name)}</span>` : '<span class="muted">—</span>'}</td>
               <td class="nowrap right">${visible ? `<a class="btn btn-sm" href="#/reports/${r.id}${qs({ back: backUrl })}">查看</a>` : ''}</td>
             </tr>`;
           }).join('')}</tbody>
         </table></div>
-        ${rows.some((r) => r.state === 'pending') ? '<div class="actions"><button class="btn btn-primary" data-confirm="確定將勾選的週報標記為查閱完成？">✔ 勾選項目標記為查閱完成</button></div>' : ''}`}
+        ${rows.some((r) => r.state === 'mine') ? '<div class="actions"><button class="btn btn-primary" data-confirm="確定核閱勾選的週報？">✔ 核閱勾選的週報</button></div>' : ''}`}
       </form>`, 'review');
 
     const filters = root.querySelector('[data-filters]');
@@ -961,17 +1049,17 @@
     if (all) all.addEventListener('change', () => root.querySelectorAll('input[name="ids"]').forEach((c) => { c.checked = all.checked; }));
     onSubmit(root.querySelector('[data-batch]'), async (fd) => {
       const ids = fd.getAll('ids').map(Number);
-      if (!ids.length) throw new Error('請先勾選要標記的週報。');
+      if (!ids.length) throw new Error('請先勾選要核閱的週報。');
       const n = must(await sb.rpc('review_reports', { p_ids: ids }));
-      setFlash(n ? 'success' : 'warning', n ? `已將 ${n} 份週報標記為查閱完成。` : '沒有可標記的週報。');
+      setFlash(n ? 'success' : 'warning', n ? `已核閱 ${n} 份週報。` : '沒有輪到您核閱的週報。');
       go(backUrl);
     });
   }
 
-  // 主管／管理員可查閱的部門
+  // 可查閱的部門：系統管理員全部；其他人＝所屬部門＋額外可查閱部門
   async function reviewScope(query) {
     const allDepts = must(await sb.from('departments').select('id, name').order('name'));
-    const departments = me.role === 'admin' ? allDepts : allDepts.filter((d) => myManaged.includes(d.id));
+    const departments = isAdmin() ? allDepts : allDepts.filter((d) => myScope().includes(d.id));
     const deptIds = departments.map((d) => d.id);
     const deptFilter = Number(query.get('dept')) || 0;
     return {
@@ -982,7 +1070,7 @@
     };
   }
   const byDeptRoleName = (deptName) => (a, b) => (deptName[a.department_id] || '').localeCompare(deptName[b.department_id] || '', 'zh-Hant')
-    || (a.role === b.role ? 0 : a.role === 'staff' ? -1 : 1) || a.name.localeCompare(b.name, 'zh-Hant');
+    || rankOrder(b) - rankOrder(a) || a.name.localeCompare(b.name, 'zh-Hant');
 
   /* ------------------------------------------------------------------ 列印多份週報 */
   async function pagePrint(query) {
@@ -991,9 +1079,10 @@
     const week = weekStartOf(query.get('week') || '') || currentWeekStart();
     const status = ['pending', 'reviewed'].includes(query.get('status')) ? query.get('status') : '';
     let reports = scopeIds.length ? await fetchAll(() => sb.from('reports')
-      .select('*, author:profiles!reports_user_id_fkey!inner(name, role, department_id)')
+      .select('*, author:profiles!reports_user_id_fkey!inner(name, role, department_id, rank:ranks(name, seniority))')
       .eq('week_start', week).eq('status', 'submitted').neq('user_id', me.id)
       .in('author.department_id', scopeIds).order('id')) : [];
+    const states = await reviewStates(reports.map((r) => r.id));
     if (status === 'pending') reports = reports.filter((r) => !r.reviewed_at);
     if (status === 'reviewed') reports = reports.filter((r) => r.reviewed_at);
     const sortKey = byDeptRoleName(deptName);
@@ -1006,7 +1095,7 @@
         <div>
           <a href="#${esc(back)}" class="small">← 返回週報查閱</a>
           <h1>列印週報</h1>
-          <div class="muted">${weekLabel(week)}，${esc(scopeLabel)}${status ? '，只含' + (status === 'pending' ? '待查閱' : '已查閱') : ''}，共 ${reports.length} 份</div>
+          <div class="muted">${weekLabel(week)}，${esc(scopeLabel)}${status ? '，只含' + (status === 'pending' ? '核閱中' : '已查閱') : ''}，共 ${reports.length} 份</div>
         </div>
         ${reports.length ? printButton(`列印／輸出 PDF（${reports.length} 份）`) : ''}
       </div>
@@ -1014,10 +1103,10 @@
       ${reports.map((r) => `
         <article class="card print-report">
           <header class="print-report-head">
-            <h2>${esc(r.author.name)} 的週報 ${badge(reportState(r))}</h2>
+            <h2>${esc(r.author.name)} 的週報 ${badge(reviewRowState(r, states.get(r.id)) === 'mine' ? 'progress' : reviewRowState(r, states.get(r.id)))}</h2>
           </header>
-          <div class="sheet report-body">${reportBodyHtml(r, deptName[r.author.department_id])}</div>
-          <section class="review-box print-review ${r.reviewed_at ? 'is-reviewed' : ''}"><h3>主管查閱</h3>${reviewStatusHtml(r)}</section>
+          <div class="sheet report-body">${reportBodyHtml(r, deptName[r.author.department_id], states.get(r.id))}</div>
+          <section class="review-box print-review ${r.reviewed_at ? 'is-reviewed' : ''}"><h3>主管核閱</h3>${reviewStatusHtml(r, states.get(r.id))}</section>
         </article>`).join('')}`, 'review');
   }
 
@@ -1035,8 +1124,8 @@
     let people = [];
     let reports = [];
     if (scopeIds.length) {
-      people = must(await sb.from('profiles').select('id, name, role, department_id, created_at')
-        .eq('active', true).in('role', ['staff', 'manager']).neq('id', me.id).in('department_id', scopeIds));
+      people = must(await sb.from('profiles').select('id, name, role, department_id, created_at, rank:ranks(name, seniority)')
+        .eq('active', true).eq('role', 'user').neq('id', me.id).in('department_id', scopeIds));
       reports = await fetchAll(() => sb.from('reports').select('id, user_id, week_start, status, submitted_at, reviewed_at')
         .eq('status', 'submitted').gte('week_start', from).lte('week_start', to).order('id'));
     }
@@ -1141,7 +1230,7 @@
           <th class="num">已繳／應繳</th><th class="num">繳交率</th><th class="num">準時</th></tr></thead>
         <tbody>${rows.map(({ p, cells, sum }) => `<tr>
           <td class="nowrap">${esc(deptName[p.department_id] || '—')}</td>
-          <td class="nowrap">${esc(p.name)}${p.role === 'manager' ? ' <span class="tag">主管</span>' : ''}</td>
+          <td class="nowrap">${esc(p.name)}${p.rank ? ` <span class="tag">${esc(p.rank.name)}</span>` : ''}</td>
           ${cells.map((c, i) => `<td class="wk ${weeks[i] === thisWeek ? 'this-week' : ''}">${cellHtml(c, weeks[i])}</td>`).join('')}
           <td class="num">${sum.submitted}／${sum.due}</td>
           <td class="num ${rateClass(sum.submitted, sum.due)}"><strong>${pct(sum.submitted, sum.due)}</strong></td>
@@ -1168,7 +1257,7 @@
   async function pageCustomers(query) {
     const [customers, allDepts] = await Promise.all([loadCustomers(), sb.from('departments').select('id, name').order('name').then(must)]);
     const deptName = Object.fromEntries(allDepts.map((d) => [d.id, d.name]));
-    const multiDept = new Set(customers.map((c) => c.department_id)).size > 1 || me.role !== 'staff';
+    const multiDept = new Set(customers.map((c) => c.department_id)).size > 1 || isAdmin() || myScope().length > 1;
     const addable = addableDepts(allDepts);
     const id = Number(query.get('id')) || 0;
     const current = customers.find((c) => c.id === id) || null;
@@ -1195,7 +1284,7 @@
     if (!current) {
       layout(`
         <div class="page-head">
-          <div><h1>客戶</h1><div class="muted">${me.role === 'admin' ? '全部部門' : me.role === 'manager' ? '所屬及負責部門' : esc(deptName[me.department_id] || '')}的客戶名錄，共 ${customers.length} 家</div></div>
+          <div><h1>客戶</h1><div class="muted">${isAdmin() ? '全部部門' : esc(myScope().map((d) => deptName[d]).filter(Boolean).join('、'))}的客戶名錄，共 ${customers.length} 家</div></div>
           ${addable.length ? '<button class="btn btn-primary" data-add>＋ 新增客戶</button>' : ''}
         </div>
         ${searchBox}
@@ -1326,13 +1415,18 @@
 
   /* ------------------------------------------------------------------ 管理：部門 */
   async function pageDepartments() {
-    if (me.role !== 'admin') return forbidden();
+    if (!isAdmin()) return forbidden();
     const [departments, profiles, managed] = await Promise.all([
       sb.from('departments').select('id, name').order('name'),
-      sb.from('profiles').select('id, name, department_id, active'),
+      sb.from('profiles').select('id, name, role, department_id, active, rank:ranks(name, seniority, is_manager)'),
       sb.from('manager_departments').select('user_id, department_id'),
     ]).then((rs) => rs.map(must));
-    const nameOf = Object.fromEntries(profiles.filter((p) => p.active).map((p) => [p.id, p.name]));
+    // 具主管權限的人員：所屬部門或額外可查閱部門為該部門，且職級有主管權限
+    const managersOf = (deptId) => profiles
+      .filter((p) => p.active && p.role === 'user' && p.rank && p.rank.is_manager
+        && (p.department_id === deptId || managed.some((m) => m.user_id === p.id && m.department_id === deptId)))
+      .sort((a, b) => rankOrder(b) - rankOrder(a))
+      .map((p) => `${p.name}（${p.rank.name}）`);
     layout(`
       <div class="page-head"><h1>部門管理</h1></div>
       <form class="card inline-form" data-create>
@@ -1342,10 +1436,10 @@
       <section class="card">
         ${!departments.length ? '<p class="muted center">尚未建立部門。</p>' : `
         <div class="table-wrap"><table>
-          <thead><tr><th>部門名稱</th><th>人數</th><th>負責主管</th><th></th></tr></thead>
+          <thead><tr><th>部門名稱</th><th>人數</th><th>具主管權限的人員</th><th></th></tr></thead>
           <tbody>${departments.map((d) => {
             const count = profiles.filter((p) => p.department_id === d.id).length;
-            const managers = managed.filter((m) => m.department_id === d.id).map((m) => nameOf[m.user_id]).filter(Boolean);
+            const managers = managersOf(d.id);
             return `<tr>
               <td><form class="inline-form" data-rename="${d.id}"><input name="name" value="${esc(d.name)}" maxlength="50" required><button class="btn btn-sm">更名</button></form></td>
               <td><a href="#/admin/users?dept=${d.id}">${count} 人</a></td>
@@ -1375,30 +1469,30 @@
 
   /* ------------------------------------------------------------------ 管理：人員 */
   async function pageUsers(query) {
-    if (me.role !== 'admin') return forbidden();
+    if (!isAdmin()) return forbidden();
     const dept = Number(query.get('dept')) || 0;
     const [departments, profiles, managed] = await Promise.all([
       sb.from('departments').select('id, name').order('name'),
-      sb.from('profiles').select('id, username, name, role, department_id, active'),
+      sb.from('profiles').select('id, username, name, role, department_id, active, rank:ranks(name, seniority)'),
       sb.from('manager_departments').select('user_id, department_id'),
     ]).then((rs) => rs.map(must));
     const deptName = Object.fromEntries(departments.map((d) => [d.id, d.name]));
-    const roleOrder = { admin: 0, manager: 1, staff: 2 };
     const users = profiles.filter((u) => !dept || u.department_id === dept).sort((a, b) =>
-      (b.active - a.active) || (deptName[a.department_id] || '').localeCompare(deptName[b.department_id] || '', 'zh-Hant')
-      || roleOrder[a.role] - roleOrder[b.role] || a.name.localeCompare(b.name, 'zh-Hant'));
+      (b.active - a.active) || (a.role === b.role ? 0 : a.role === 'admin' ? -1 : 1)
+      || (deptName[a.department_id] || '').localeCompare(deptName[b.department_id] || '', 'zh-Hant')
+      || rankOrder(b) - rankOrder(a) || a.name.localeCompare(b.name, 'zh-Hant'));
     layout(`
       <div class="page-head"><h1>人員與權限</h1><a class="btn btn-primary" href="#/admin/users/new">＋ 新增人員</a></div>
       <form class="card inline-form" data-filter>
         <select name="dept"><option value="">全部部門</option>${departments.map((d) => `<option value="${d.id}" ${d.id === dept ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select>
       </form>
       <section class="card"><div class="table-wrap"><table>
-        <thead><tr><th>姓名</th><th>帳號</th><th>角色</th><th>所屬部門</th><th>可查閱部門</th><th>狀態</th><th></th></tr></thead>
+        <thead><tr><th>姓名</th><th>帳號</th><th>職級</th><th>所屬部門</th><th>額外可查閱部門</th><th>狀態</th><th></th></tr></thead>
         <tbody>${users.map((u) => `
           <tr class="${u.active ? '' : 'inactive'}">
             <td>${esc(u.name)}</td>
             <td><code>${esc(u.username)}</code></td>
-            <td><span class="tag tag-${u.role}">${ROLE_LABELS[u.role]}</span></td>
+            <td>${u.role === 'admin' ? '<span class="tag tag-admin">系統管理員</span>' : `<span class="tag ${u.rank && ranks.find((r) => r.name === u.rank.name && r.is_manager) ? 'tag-manager' : ''}">${esc(u.rank ? u.rank.name : '—')}</span>`}</td>
             <td>${esc(deptName[u.department_id] || '—')}</td>
             <td>${u.role === 'admin' ? '全部' : esc(managed.filter((m) => m.user_id === u.id).map((m) => deptName[m.department_id]).join('、')) || '—'}</td>
             <td>${u.active ? '啟用' : '停用'}</td>
@@ -1407,22 +1501,24 @@
         </tbody>
       </table></div></section>
       <section class="card muted small">
-        <strong>角色說明</strong>
+        <strong>權限說明</strong>
         <ul>
-          <li><b>業務人員</b>：填寫、提交自己的週報，查看主管查閱狀態與意見。</li>
-          <li><b>主管</b>：查看「可查閱部門」內人員已提交的週報，標記查閱完成並留下意見；主管本人也可填寫週報。</li>
-          <li><b>系統管理員</b>：可查閱所有部門週報，並管理部門、人員帳號與權限。</li>
+          <li><b>職級</b>：可查閱同部門（含額外可查閱部門）中職級比自己低的人員與週報；同職級、較高職級看不到。職級名稱與高低在「<a href="#/admin/ranks">職級</a>」設定。</li>
+          <li><b>逐級核閱</b>：週報由低到高、每一個職級各核閱一次（同職級任一人即可），全部完成才算「已查閱」。</li>
+          <li><b>主管權限</b>（在「職級」勾選）：可管理所屬及額外可查閱部門的客戶名錄、週會紀錄。</li>
+          <li><b>系統管理員</b>：可查閱所有週報、代為完成核閱，並管理部門、職級、人員帳號與權限。</li>
         </ul>
       </section>`, 'users');
     root.querySelector('[data-filter]').addEventListener('change', (e) => go('/admin/users' + qs({ dept: e.target.value })));
   }
 
   async function pageUserForm(id) {
-    if (me.role !== 'admin') return forbidden();
+    if (!isAdmin()) return forbidden();
     const departments = must(await sb.from('departments').select('id, name').order('name'));
-    let user = { id: null, username: '', name: '', role: 'staff', department_id: null, active: true, managed: [] };
+    const lowest = ranks.length ? ranks[ranks.length - 1].id : null;
+    let user = { id: null, username: '', name: '', role: 'user', rank_id: lowest, department_id: null, active: true, managed: [] };
     if (id) {
-      const u = must(await sb.from('profiles').select('id, username, name, role, department_id, active').eq('id', id).maybeSingle());
+      const u = must(await sb.from('profiles').select('id, username, name, role, rank_id, department_id, active').eq('id', id).maybeSingle());
       if (!u) return errorPage('找不到人員', '人員不存在。');
       const m = must(await sb.from('manager_departments').select('department_id').eq('user_id', id));
       user = { ...u, managed: m.map((r) => r.department_id) };
@@ -1435,11 +1531,13 @@
         <div class="field-grid">
           <label>登入帳號<input name="username" value="${esc(user.username)}" pattern="[A-Za-z0-9._\\-]{3,50}" title="3–50 個英數字或 . _ - 符號" required autocomplete="off"></label>
           <label>姓名<input name="name" value="${esc(user.name)}" maxlength="50" required></label>
-          <label>角色<select name="role" data-role>${['staff', 'manager', 'admin'].map((r) => `<option value="${r}" ${user.role === r ? 'selected' : ''}>${ROLE_LABELS[r]}</option>`).join('')}</select></label>
+          <label>帳號類型<select name="role" data-role>${['user', 'admin'].map((r) => `<option value="${r}" ${user.role === r ? 'selected' : ''}>${ROLE_LABELS[r]}</option>`).join('')}</select></label>
+          <label data-user-only>職級<select name="rank_id">${ranks.map((r) => `<option value="${r.id}" ${r.id === user.rank_id ? 'selected' : ''}>${esc(r.name)}${r.is_manager ? '（主管權限）' : ''}</option>`).join('')}</select></label>
           <label>所屬部門<select name="department_id"><option value="">（無）</option>${departments.map((d) => `<option value="${d.id}" ${d.id === user.department_id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>
         </div>
-        <fieldset class="managed" data-managed>
-          <legend>可查閱的部門（主管專用）</legend>
+        <fieldset class="managed" data-user-only>
+          <legend>額外可查閱的部門（選填）</legend>
+          <p class="hint" style="flex-basis:100%;margin:0">在這些部門裡，同樣可查閱職級比自己低的人員（例如一位協理同時負責兩個部門）。</p>
           ${!departments.length ? '<span class="muted">尚無部門</span>' : ''}
           ${departments.map((d) => `<label class="check-label"><input type="checkbox" name="managed" value="${d.id}" ${user.managed.includes(d.id) ? 'checked' : ''}> ${esc(d.name)}</label>`).join('')}
         </fieldset>
@@ -1452,19 +1550,20 @@
       </form>`, 'users');
 
     const role = root.querySelector('[data-role]');
-    const managed = root.querySelector('[data-managed]');
-    const sync = () => { managed.hidden = role.value !== 'manager'; };
+    const sync = () => root.querySelectorAll('[data-user-only]').forEach((el) => { el.hidden = role.value !== 'user'; });
     role.addEventListener('change', sync);
     sync();
     onSubmit(root.querySelector('[data-form]'), async (fd) => {
       const name = String(fd.get('name') || '').trim();
+      const isUser = fd.get('role') === 'user';
       must(await sb.rpc('admin_save_user', {
         p_id: user.id,
         p_username: String(fd.get('username') || '').trim(),
         p_name: name,
         p_role: fd.get('role'),
+        p_rank_id: isUser ? Number(fd.get('rank_id')) || null : null,
         p_department_id: Number(fd.get('department_id')) || null,
-        p_managed: fd.getAll('managed').map(Number),
+        p_extra_depts: isUser ? fd.getAll('managed').map(Number) : [],
         p_active: fd.get('active') === '1',
         p_password: String(fd.get('password') || ''),
       }));
@@ -1473,9 +1572,78 @@
     });
   }
 
+  /* ------------------------------------------------------------------ 管理：職級 */
+  async function pageRanks() {
+    if (!isAdmin()) return forbidden();
+    const [list, people] = await Promise.all([
+      sb.from('ranks').select('id, name, seniority, is_manager').order('seniority', { ascending: false }),
+      sb.from('profiles').select('rank_id').eq('role', 'user'),
+    ]).then((rs) => rs.map(must));
+    const count = (id) => people.filter((p) => p.rank_id === id).length;
+    layout(`
+      <div class="page-head">
+        <div><h1>職級</h1><div class="muted">由高到低排列。高職級可查閱同部門（含額外可查閱部門）職級較低的人員，週報由低到高逐級核閱。</div></div>
+      </div>
+      <section class="card"><div class="table-wrap"><table>
+        <thead><tr><th>高低</th><th>職級名稱</th><th>主管權限</th><th class="num">人數</th><th></th></tr></thead>
+        <tbody>${list.map((r, i) => `
+          <tr>
+            <td class="nowrap">
+              <button type="button" class="btn btn-sm" data-move="${r.id}" data-up="1" ${i === 0 ? 'disabled' : ''} aria-label="調高「${esc(r.name)}」">↑</button>
+              <button type="button" class="btn btn-sm" data-move="${r.id}" data-up="0" ${i === list.length - 1 ? 'disabled' : ''} aria-label="調低「${esc(r.name)}」">↓</button>
+            </td>
+            <td><form class="inline-form" data-rank="${r.id}">
+              <input name="name" value="${esc(r.name)}" maxlength="20" required aria-label="職級名稱">
+              <label class="check-label small"><input type="checkbox" name="is_manager" value="1" ${r.is_manager ? 'checked' : ''}> 主管權限</label>
+              <button class="btn btn-sm">儲存</button>
+            </form></td>
+            <td>${r.is_manager ? '<span class="tag tag-manager">有</span>' : '<span class="muted">—</span>'}</td>
+            <td class="num"><a href="#/admin/users">${count(r.id)} 人</a></td>
+            <td class="right"><button type="button" class="btn btn-sm btn-danger-outline" data-del-rank="${r.id}" data-confirm="確定刪除職級「${esc(r.name)}」？" ${count(r.id) ? 'disabled title="仍有人員是這個職級"' : ''}>刪除</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div></section>
+      <form class="card inline-form" data-create>
+        <input name="name" placeholder="新職級名稱" maxlength="20" required>
+        <label class="check-label small"><input type="checkbox" name="is_manager" value="1"> 主管權限</label>
+        <button class="btn btn-primary">新增職級</button>
+        <span class="hint">新增的職級會排在最低，可再用 ↑ 調整位置。</span>
+      </form>
+      <section class="card muted small">
+        <strong>說明</strong>
+        <ul>
+          <li>調整高低後立即生效：誰看得到誰、週報要經過哪些層級核閱都會跟著改變；已蓋的核閱章會保留。</li>
+          <li><b>主管權限</b>：可管理所屬及額外可查閱部門的客戶名錄（修改、停用、刪除）與週會紀錄。</li>
+          <li>仍有人員的職級不能刪除，請先到「人員與權限」調整這些人員的職級。</li>
+        </ul>
+      </section>`, 'ranks');
+
+    const done = async (msg) => { ranks = must(await sb.from('ranks').select('id, name, seniority, is_manager').order('seniority', { ascending: false })); setFlash('success', msg); go('/admin/ranks'); };
+    onSubmit(root.querySelector('[data-create]'), async (fd) => {
+      must(await sb.rpc('admin_save_rank', { p_id: null, p_name: fd.get('name'), p_is_manager: fd.get('is_manager') === '1' }));
+      await done(`已新增職級「${String(fd.get('name')).trim()}」。`);
+    });
+    root.querySelectorAll('[data-rank]').forEach((f) => onSubmit(f, async (fd) => {
+      must(await sb.rpc('admin_save_rank', { p_id: Number(f.dataset.rank), p_name: fd.get('name'), p_is_manager: fd.get('is_manager') === '1' }));
+      await done('職級已更新。');
+    }));
+    root.querySelectorAll('[data-move]').forEach((b) => b.addEventListener('click', async () => {
+      try {
+        must(await sb.rpc('admin_move_rank', { p_id: Number(b.dataset.move), p_up: b.dataset.up === '1' }));
+        await done('職級順序已調整。');
+      } catch (e) { window.alert(e.message); }
+    }));
+    root.querySelectorAll('[data-del-rank]').forEach((b) => b.addEventListener('click', async () => {
+      try {
+        must(await sb.rpc('admin_delete_rank', { p_id: Number(b.dataset.delRank) }));
+        await done('職級已刪除。');
+      } catch (e) { window.alert(e.message); }
+    }));
+  }
+
   /* ------------------------------------------------------------------ 週會紀錄 */
   function canManageMeeting(dept) {
-    return me.role === 'admin' || (me.role === 'manager' && myManaged.includes(dept));
+    return canManageDept(dept);
   }
   function departmentOptions(departments, selected) {
     return departments.map((d) => `<option value="${d.id}" ${d.id === selected ? 'selected' : ''}>${esc(d.name)}</option>`).join('');
@@ -1704,7 +1872,7 @@
 
   /* ------------------------------------------------------------------ 路由 */
   const routes = [
-    [/^\/$/, () => go(me.role === 'staff' ? '/reports' : '/review')],
+    [/^\/$/, () => go(isReviewer() ? '/review' : '/reports')],
     [/^\/password$/, pagePassword],
     [/^\/reports$/, pageMyReports],
     [/^\/reports\/new$/, (m, q) => pageReportForm(null, q)],
@@ -1718,6 +1886,7 @@
     [/^\/meetings\/(\d+)$/, (m) => pageMeeting(Number(m[1]))],
     [/^\/customers$/, (m, q) => pageCustomers(q)],
     [/^\/admin\/departments$/, pageDepartments],
+    [/^\/admin\/ranks$/, pageRanks],
     [/^\/admin\/users$/, (m, q) => pageUsers(q)],
     [/^\/admin\/users\/new$/, () => pageUserForm(null)],
     [/^\/admin\/users\/([0-9a-f-]{36})$/, (m) => pageUserForm(m[1])],
