@@ -35,10 +35,16 @@ async function as(uid, sql, params = []) {
   }
 }
 const sys = async (sql, params) => (await pool.query(sql, params)).rows;
-const rpcUser = (uid, fields) => as(uid,
-  'select public.admin_save_user($1,$2,$3,$4,$5,$6,$7,$8) as id',
-  [fields.id || null, fields.username, fields.name, fields.role, fields.dept || null, fields.managed || [], fields.active ?? true, fields.password || '']
-).then((r) => r[0].id);
+const rankId = async (name) => (name ? ((await sys('select id from ranks where name = $1', [name]))[0] || {}).id ?? null : null);
+// role：admin＝系統管理員；其他為一般人員。舊版角色對應職級：manager → 經理、staff → 專員（也可用 rank 指定）
+// managed：額外可查閱部門
+const rpcUser = async (uid, f) => {
+  const role = f.role === 'admin' ? 'admin' : 'user';
+  const rank = f.rank !== undefined ? f.rank : ({ manager: '經理', staff: '專員' })[f.role];
+  return as(uid, 'select public.admin_save_user($1,$2,$3,$4,$5,$6,$7,$8,$9) as id',
+    [f.id || null, f.username, f.name, role, role === 'user' ? await rankId(rank) : null,
+      f.dept || null, f.managed || [], f.active ?? true, f.password || '']).then((r) => r[0].id);
+};
 // work：週一的工作內容（其餘天空白）
 const saveDays = (uid, id, week, days, submit, legacy = '') => as(uid,
   `select public.save_report(p_id => $1, p_week => $2, p_work_summary => $3, p_daily_work => $4,
@@ -82,7 +88,7 @@ test('管理員設定部門與人員', async () => {
   bob = await rpcUser(admin, { username: 'bob', name: '業務 Bob', role: 'staff', dept: d2, password: 'pass12345' });
 
   await assert.rejects(rpcUser(admin, { username: 'AMY', name: 'x', role: 'staff', dept: d1, password: 'pass12345' }), /此帳號已被使用/);
-  await assert.rejects(rpcUser(admin, { username: 'mgr2', name: 'x', role: 'manager', dept: d1, password: 'pass12345' }), /至少需設定一個可查閱的部門/);
+  await assert.rejects(rpcUser(admin, { username: 'mgr2', name: 'x', role: 'user', rank: null, dept: d1, password: 'pass12345' }), /請選擇職級/);
   await assert.rejects(rpcUser(admin, { username: 'staff2', name: 'x', role: 'staff', password: 'pass12345' }), /請選擇所屬部門/);
   await assert.rejects(rpcUser(admin, { username: 'staff3', name: 'x', role: 'staff', dept: d1, password: 'short' }), /至少需 8 個字元/);
   await assert.rejects(rpcUser(admin, { id: admin, username: 'admin', name: 'x', role: 'staff', dept: d1 }), /不可停用自己的帳號/);
@@ -94,7 +100,9 @@ test('管理員設定部門與人員', async () => {
   const [u] = await sys("select email, extensions.crypt('pass12345', encrypted_password) = encrypted_password as ok from auth.users where id = $1", [amy]);
   assert.deepStrictEqual(u, { email: 'amy@weeklyreport.example.com', ok: true });
   assert.strictEqual((await sys('select must_change_password from profiles where id = $1', [amy]))[0].must_change_password, true);
-  assert.deepStrictEqual((await sys('select department_id from manager_departments where user_id = $1', [boss])).map((r) => r.department_id), [d1]);
+  // 所屬部門不需再列為額外可查閱部門
+  assert.deepStrictEqual((await sys('select department_id from manager_departments where user_id = $1', [boss])).map((r) => r.department_id), []);
+  assert.deepStrictEqual((await sys("select r.name from profiles p join ranks r on r.id = p.rank_id where p.id = any($1) order by r.seniority desc", [[boss, amy]])).map((r) => r.name), ['經理', '專員']);
 });
 
 test('變更密碼', async () => {
@@ -112,7 +120,7 @@ test('RLS：人員資料可見範圍', async () => {
   assert.deepStrictEqual(await names(boss), ['amy', 'boss']);
   assert.deepStrictEqual(await names(admin), ['admin', 'amy', 'bob', 'boss']);
   assert.strictEqual((await as(amy, 'select * from public.manager_departments')).length, 0);
-  assert.strictEqual((await as(boss, 'select * from public.manager_departments')).length, 1);
+  assert.strictEqual((await as(boss, 'select * from public.manager_departments')).length, 0);
 });
 
 test('前端角色不能直接寫入資料表', async () => {
@@ -147,7 +155,7 @@ test('週報流程：草稿 → 提交 → 查閱 → 鎖定 → 撤回', async 
   await as(boss, "select public.review_report($1, 'review', '做得好')", [rid]);
   const [r] = await as(amy, 'select reviewed_at is not null as reviewed, reviewer_name, review_comment from public.reports where id = $1', [rid]);
   assert.deepStrictEqual(r, { reviewed: true, reviewer_name: '王經理', review_comment: '做得好' });
-  await assert.rejects(save(amy, rid, null, '偷改', true), /主管已查閱/);
+  await assert.rejects(save(amy, rid, null, '偷改', true), /已有主管核閱/);
   await assert.rejects(as(amy, 'select public.delete_draft($1)', [rid]), /只有草稿可以刪除/);
 
   const logs = await as(amy, 'select action, user_name from public.review_logs where report_id = $1', [rid]);
@@ -164,7 +172,9 @@ test('批次查閱只會標記有權限的週報', async () => {
   const n = await as(boss, 'select public.review_reports($1) as n', [[rid, rb]]).then((r) => r[0].n);
   assert.strictEqual(n, 1);
   assert.strictEqual((await sys('select reviewed_at is null as pending from reports where id = $1', [rb]))[0].pending, true);
-  await assert.rejects(as(amy, 'select public.review_reports($1)', [[rid]]), /沒有權限/);
+  // 沒有輪到自己核閱的週報會被略過（專員沒有下屬，核閱 0 份）
+  assert.strictEqual(await as(amy, 'select public.review_reports($1) as n', [[rid, rb]]).then((r) => r[0].n), 0);
+  await assert.rejects(as(null, 'select public.review_reports($1)', [[rid]]), /permission denied/);
 });
 
 test('刪除草稿', async () => {
@@ -254,7 +264,7 @@ test('客戶名錄：依部門隔開、權限與別名防重複', async () => {
   // 不同部門可以有同名客戶
   const c2 = await saveCust(s4, { dept: d2, name: '大成科技' });
   // 修改：業務不行，主管可以
-  await assert.rejects(saveCust(s1, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'] }), /只有主管或系統管理員/);
+  await assert.rejects(saveCust(s1, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'] }), /只有具主管權限的職級或系統管理員/);
   await saveCust(mgr3, { id: c3, dept: d3, name: '大成科技', aliases: ['大成', 'DC電子'] });
   await assert.rejects(saveCust(mgr3, { id: c2, dept: d2, name: '大成科技' }), /客戶不存在/);
   await assert.rejects(as(s1, "update public.customers set name = 'x'"), /permission denied/);
@@ -305,7 +315,7 @@ test('刪除客戶：負責部門的主管與系統管理員可以，週報內�
   const reportsBefore = (await sys('select count(*)::int as c from reports'))[0].c;
 
   const c1 = await newCust('待刪客戶甲');
-  await assert.rejects(as(staff, 'select public.admin_delete_customer($1)', [c1]), /只有負責這個部門的主管或系統管理員/);
+  await assert.rejects(as(staff, 'select public.admin_delete_customer($1)', [c1]), /只有具主管權限的職級或系統管理員/);
   await assert.rejects(as(boss, 'select public.admin_delete_customer($1)', [c1]), /客戶不存在/, '別部門的主管看不到也刪不了');
   await assert.rejects(as(null, 'select public.admin_delete_customer($1)', [c1]), /permission denied/);
   await assert.rejects(as(mgr, 'delete from public.customers where id = $1', [c1]), /permission denied/);
@@ -367,7 +377,7 @@ test('每日多筆拜訪：客戶、聯絡人、內容，聯絡人自動加入�
   // 主管可在「編輯客戶」修正聯絡人；業務不行
   await as(mgr, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true, array['王經理', ' 李小姐 ', '王經理', '']) as id", [cid, dept]);
   assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
-  await assert.rejects(as(staff, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true, array['x'])", [cid, dept]), /只有主管或系統管理員/);
+  await assert.rejects(as(staff, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true, array['x'])", [cid, dept]), /只有具主管權限的職級或系統管理員/);
   // 不傳聯絡人（舊版網頁）時保留原清單
   await as(mgr, "select public.save_customer($1, $2, '環宇貿易', array['環宇'], true) as id", [cid, dept]);
   assert.deepStrictEqual((await sys('select contacts from customers where id = $1', [cid]))[0].contacts, ['王經理', '李小姐']);
@@ -375,7 +385,7 @@ test('每日多筆拜訪：客戶、聯絡人、內容，聯絡人自動加入�
 
 test('週會紀錄：指定記錄人、草稿權限、版本衝突及發布', async () => {
   const [{ id: colleague }] = await as(admin,
-    "select public.admin_save_user(null, 'meetingreader', '同部門人員', 'staff', $1, null, true, 'pass12345') as id", [d1]);
+    "select public.admin_save_user(null, 'meetingreader', '同部門人員', 'user', (select id from ranks where name = '專員'), $1, null, true, 'pass12345') as id", [d1]);
   const attendees = [
     { name: 'Amy', report: '第一段\n第二段', note: '個人附註' },
     { name: '外部來賓', report: '', note: '' },
@@ -411,4 +421,130 @@ test('週會紀錄：指定記錄人、草稿權限、版本衝突及發布', as
   assert.equal(published.notes, '全場附註');
   assert.equal((await read(bob, id)).length, 0);
   await assert.rejects(write(boss, id, 3, false), /已發布/);
+});
+
+test('職級：只看得到同部門（含額外部門）職級較低的人員', async () => {
+  const dR = await as(admin, "select public.admin_save_department(null, '職級測試部') as id").then((r) => r[0].id);
+  const dX = await as(admin, "select public.admin_save_department(null, '外部支援部') as id").then((r) => r[0].id);
+  const mk = (username, name, rank, dept, extra = []) => rpcUser(admin, { username, name, role: 'user', rank, dept, managed: extra, password: 'pass12345' });
+  const A = await mk('r_vp', '協理甲', '協理', dR, [dX]);
+  const B1 = await mk('r_mgr1', '經理甲', '經理', dR);
+  const B2 = await mk('r_mgr2', '經理乙', '經理', dR);
+  const C = await mk('r_dep', '副理甲', '副理', dR);
+  const D = await mk('r_staff', '專員甲', '專員', dR);
+  const E = await mk('r_ext', '專員乙', '專員', dX);
+  const names = async (uid) => (await as(uid, "select name from public.profiles where username like 'r\\_%' order by name")).map((r) => r.name);
+  assert.deepStrictEqual(await names(A), ['副理甲', '專員乙', '專員甲', '協理甲', '經理乙', '經理甲'].sort());
+  assert.deepStrictEqual(await names(B1), ['副理甲', '專員甲', '經理甲'].sort(), '同職級（經理乙）、較高職級（協理）看不到');
+  assert.deepStrictEqual(await names(C), ['副理甲', '專員甲'].sort());
+  assert.deepStrictEqual(await names(D), ['專員甲']);
+  assert.deepStrictEqual(await names(E), ['專員乙'], '別部門');
+  // 週報：同職級、較高職級的週報看不到
+  const rB2 = await save(B2, null, '2027-01-04', '經理乙的週報', true);
+  assert.strictEqual((await as(B1, 'select id from public.reports where id = $1', [rB2])).length, 0);
+  assert.strictEqual((await as(A, 'select id from public.reports where id = $1', [rB2])).length, 1);
+  assert.strictEqual((await as(C, 'select id from public.reports where id = $1', [rB2])).length, 0);
+
+  // 調整職級順序立即生效：副理移到經理之上 → 副理看得到經理，經理看不到副理
+  const [{ id: depRank }] = await sys("select id from ranks where name = '副理'");
+  await as(admin, 'select public.admin_move_rank($1, true)', [depRank]);
+  assert.deepStrictEqual(await names(C), ['副理甲', '專員甲', '經理乙', '經理甲'].sort());
+  assert.deepStrictEqual(await names(B1), ['專員甲', '經理甲'].sort());
+  await as(admin, 'select public.admin_move_rank($1, false)', [depRank]);
+  assert.deepStrictEqual(await names(C), ['副理甲', '專員甲'].sort());
+  await assert.rejects(as(admin, "select public.admin_move_rank((select id from ranks where name = '協理'), true)"), /已經是最高職級/);
+});
+
+test('逐級核閱：由低到高依序蓋章，全部完成才算已查閱', async () => {
+  const id = async (u) => (await sys('select id from profiles where username = $1', [u]))[0].id;
+  const [A, B1, B2, C, D, E] = await Promise.all(['r_vp', 'r_mgr1', 'r_mgr2', 'r_dep', 'r_staff', 'r_ext'].map(id));
+  const rid = await save(D, null, '2027-01-04', '專員的週報', true);
+  const state = (uid, rep = rid) => as(uid, 'select * from public.report_review_states($1)', [[rep]]).then((r) => r[0]);
+  const review = (uid, action = 'review', comment = '', rep = rid) => as(uid, 'select public.review_report($1, $2, $3)', [rep, action, comment]);
+  const levels = async (uid = admin) => (await state(uid)).levels.map((l) => `${l.rank_name}:${l.stamped ? l.user_name : '待核閱'}`);
+
+  assert.deepStrictEqual(await levels(), ['副理:待核閱', '經理:待核閱', '協理:待核閱']);
+  assert.strictEqual((await state(C)).can_stamp, true);
+  assert.strictEqual((await state(B1)).can_stamp, false);
+  await assert.rejects(review(B1), /目前輪到「副理」核閱/);
+
+  await review(C, 'review', '內容清楚');
+  await assert.rejects(save(D, rid, null, '想再改', true), /已有主管核閱/);
+  await review(B1);
+  await assert.rejects(review(B2), /目前輪到「協理」核閱/, '同層級已有人核閱');
+  await assert.rejects(review(C, 'unreview'), /只能撤回自己的核閱/, '上一層級已核閱');
+  assert.strictEqual((await sys('select reviewed_at from reports where id = $1', [rid]))[0].reviewed_at, null);
+
+  await review(A, 'review', '同意');
+  const [done] = await sys('select reviewed_at is not null as ok, reviewer_name, review_comment from reports where id = $1', [rid]);
+  assert.deepStrictEqual(done, { ok: true, reviewer_name: '協理甲', review_comment: '同意' });
+  assert.deepStrictEqual(await levels(), ['副理:副理甲', '經理:經理甲', '協理:協理甲']);
+  assert.strictEqual((await state(D)).complete, true, '作者也看得到核閱結果');
+  await assert.rejects(review(A), /已完成核閱/);
+
+  // 撤回：最高層級撤回後回到未完成，換下一層可撤回
+  assert.strictEqual((await state(A)).can_withdraw, true);
+  assert.strictEqual((await state(B1)).can_withdraw, false);
+  await review(A, 'unreview');
+  assert.strictEqual((await sys('select reviewed_at from reports where id = $1', [rid]))[0].reviewed_at, null);
+  assert.deepStrictEqual(await levels(), ['副理:副理甲', '經理:經理甲', '協理:待核閱']);
+  assert.strictEqual((await state(B1)).can_withdraw, true);
+  // 系統管理員撤回全部 → 作者可再修改
+  await review(admin, 'unreview');
+  assert.deepStrictEqual(await levels(), ['副理:待核閱', '經理:待核閱', '協理:待核閱']);
+  await save(D, rid, null, '修改後再提交', true);
+
+  // 批次核閱只處理輪到自己的
+  assert.strictEqual(await as(B1, 'select public.review_reports($1) as n', [[rid]]).then((r) => r[0].n), 0);
+  assert.strictEqual(await as(C, 'select public.review_reports($1) as n', [[rid]]).then((r) => r[0].n), 1);
+
+  // 某層級無在職人員時自動略過：停用副理 → 剩經理、協理
+  const rid2 = await save(D, null, '2027-01-11', '第二週', true);
+  await rpcUser(admin, { id: C, username: 'r_dep', name: '副理甲', role: 'user', rank: '副理', dept: (await sys('select department_id from profiles where id = $1', [C]))[0].department_id, active: false });
+  assert.deepStrictEqual((await state(admin, rid2)).levels.map((l) => l.rank_name), ['經理', '協理']);
+  await rpcUser(admin, { id: C, username: 'r_dep', name: '副理甲', role: 'user', rank: '副理', dept: (await sys('select department_id from profiles where id = $1', [C]))[0].department_id, active: true });
+
+  // 沒有上級的週報（協理）：只有系統管理員能代為完成
+  const ridA = await save(A, null, '2027-01-04', '協理的週報', true);
+  assert.deepStrictEqual((await state(admin, ridA)).levels, []);
+  await review(admin, 'review', '已閱', ridA);
+  const [vp] = await sys('select reviewed_at is not null as ok, reviewer_name from reports where id = $1', [ridA]);
+  assert.deepStrictEqual(vp, { ok: true, reviewer_name: '系統管理員' });
+  assert.deepStrictEqual((await state(admin, ridA)).levels.map((l) => [l.rank_name, l.admin]), [['系統管理員', true]]);
+
+  // 額外可查閱部門：協理是外部支援部專員的核閱層級
+  const ridE = await save(E, null, '2027-01-04', '支援部週報', true);
+  assert.deepStrictEqual((await state(admin, ridE)).levels.map((l) => l.rank_name), ['協理']);
+  await review(A, 'review', '', ridE);
+  assert.strictEqual((await state(E, ridE)).complete, true);
+
+  // 看不到的週報拿不到核閱狀態
+  assert.strictEqual(await state(B2, ridA), undefined);
+  assert.strictEqual(await state(E, rid), undefined);
+});
+
+test('職級管理：只有系統管理員可以新增、改名、調整、刪除；主管權限控制客戶管理', async () => {
+  const [{ id: C }] = await sys("select id from profiles where username = 'r_dep'");
+  const [{ department_id: dR }] = await sys("select department_id from profiles where username = 'r_dep'");
+  const [{ id: depRank }] = await sys("select id from ranks where name = '副理'");
+  await assert.rejects(as(C, "select public.admin_save_rank(null, '實習生', false)"), /沒有權限/);
+  await assert.rejects(as(C, 'select public.admin_move_rank($1, true)', [depRank]), /沒有權限/);
+  const newRank = await as(admin, "select public.admin_save_rank(null, '實習生', false) as id").then((r) => r[0].id);
+  assert.strictEqual((await sys('select name from ranks order by seniority limit 1'))[0].name, '實習生', '新增的職級排在最低');
+  await assert.rejects(as(admin, "select public.admin_save_rank(null, '經理', false)"), /職級名稱已存在/);
+  await as(admin, 'select public.admin_delete_rank($1)', [newRank]);
+  await assert.rejects(as(admin, 'select public.admin_delete_rank($1)', [depRank]), /仍有人員是這個職級/);
+  await assert.rejects(as(admin, 'delete from public.ranks'), /permission denied/);
+
+  // 主管權限：副理預設沒有 → 不能修改客戶；勾選後可以
+  const cust = await as(C, "select public.save_customer(null, $1, '職級測試客戶', '{}', true) as id", [dR]).then((r) => r[0].id);
+  await assert.rejects(as(C, "select public.save_customer($1, $2, '職級測試客戶', array['職級測試'], true)", [cust, dR]), /只有具主管權限的職級/);
+  await as(admin, "select public.admin_save_rank($1, '副理', true)", [depRank]);
+  await as(C, "select public.save_customer($1, $2, '職級測試客戶', array['職級測試'], true)", [cust, dR]);
+  await as(C, 'select public.admin_delete_customer($1)', [cust]);
+  await as(admin, "select public.admin_save_rank($1, '副理', false)", [depRank]);
+  // 改名
+  await as(admin, "select public.admin_save_rank($1, '副理（測試）', null)", [depRank]);
+  assert.strictEqual((await sys('select name, is_manager from ranks where id = $1', [depRank]))[0].name, '副理（測試）');
+  await as(admin, "select public.admin_save_rank($1, '副理', null)", [depRank]);
 });

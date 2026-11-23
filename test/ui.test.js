@@ -40,13 +40,19 @@ const U = {
 };
 const db = {
   departments: [{ id: 1, name: '北區業務部' }, { id: 2, name: '南區業務部' }],
-  profiles: [
-    { id: U.admin, username: 'admin', name: '系統管理員', role: 'admin', department_id: null, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
-    { id: U.boss, username: 'boss', name: '王經理', role: 'manager', department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
-    { id: U.amy, username: 'amy', name: '陳小明', role: 'staff', department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
-    { id: U.bob, username: 'bob', name: '黃大偉', role: 'staff', department_id: 2, active: true, must_change_password: true, created_at: new Date().toISOString() },
+  ranks: [
+    { id: 1, name: '協理', seniority: 60, is_manager: true }, { id: 2, name: '經理', seniority: 50, is_manager: true },
+    { id: 3, name: '副理', seniority: 40, is_manager: false }, { id: 4, name: '主任', seniority: 30, is_manager: false },
+    { id: 5, name: '副主任', seniority: 20, is_manager: false }, { id: 6, name: '專員', seniority: 10, is_manager: false },
   ],
-  manager_departments: [{ user_id: U.boss, department_id: 1 }],
+  profiles: [
+    { id: U.admin, username: 'admin', name: '系統管理員', role: 'admin', rank_id: null, department_id: null, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.boss, username: 'boss', name: '王經理', role: 'user', rank_id: 2, department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.amy, username: 'amy', name: '陳小明', role: 'user', rank_id: 6, department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' },
+    { id: U.bob, username: 'bob', name: '黃大偉', role: 'user', rank_id: 6, department_id: 2, active: true, must_change_password: true, created_at: new Date().toISOString() },
+  ],
+  manager_departments: [],
+  report_stamps: [],
   reports: [
     {
       id: 1, user_id: U.amy, week_start: LAST_WEEK, work_summary: '', customer_visits: '採購王課長',
@@ -66,11 +72,57 @@ const rpcCalls = [];
 
 const profileOf = (id) => db.profiles.find((p) => p.id === id);
 const deptOf = (id) => db.departments.find((d) => d.id === id) || null;
+const rankOf = (id) => db.ranks.find((r) => r.id === id) || null;
+const isAdminUser = (uid) => { const p = profileOf(uid); return Boolean(p && p.active && p.role === 'admin'); };
+// 所屬部門＋額外可查閱部門
+const scopeOf = (uid) => { const p = profileOf(uid); return [p.department_id, ...db.manager_departments.filter((m) => m.user_id === uid).map((m) => m.department_id)].filter(Boolean); };
+// 與 schema.sql 的 user_can_view 相同：同部門（含額外部門）且職級較低
+function userCanView(v, t) {
+  const pv = profileOf(v);
+  const pt = profileOf(t);
+  if (!pv || !pt || !pv.active || pv.role !== 'user' || pt.role !== 'user' || v === t || !pt.department_id) return false;
+  return rankOf(pt.rank_id).seniority < rankOf(pv.rank_id).seniority && scopeOf(v).includes(pt.department_id);
+}
+const canViewUser = (uid, t) => isAdminUser(uid) || userCanView(uid, t);
+// 主管權限（客戶名錄、週會紀錄）
 function canReviewDept(uid, dept) {
   const me = profileOf(uid);
   if (!me || !me.active) return false;
   if (me.role === 'admin') return true;
-  return me.role === 'manager' && db.manager_departments.some((m) => m.user_id === uid && m.department_id === dept);
+  return Boolean(rankOf(me.rank_id) && rankOf(me.rank_id).is_manager && scopeOf(uid).includes(dept));
+}
+// 逐級核閱（與 schema.sql 的 review_chain / review_state 相同）
+function reviewChain(author) {
+  const seen = new Map();
+  db.profiles.filter((v) => v.active && v.role === 'user' && userCanView(v.id, author)).forEach((v) => { const r = rankOf(v.rank_id); seen.set(r.id, r); });
+  return [...seen.values()].sort((a, b) => a.seniority - b.seniority);
+}
+function reviewState(rid) {
+  const r = db.reports.find((x) => x.id === rid);
+  const stamps = db.report_stamps.filter((x) => x.report_id === rid).sort((a, b) => a.seniority - b.seniority);
+  const top = Math.max(-Infinity, ...stamps.filter((x) => x.rank_id).map((x) => x.seniority));
+  const pending = r.reviewed_at || r.status !== 'submitted' ? [] : reviewChain(r.user_id)
+    .filter((c) => !stamps.some((x) => x.rank_id === c.id) && c.seniority > top);
+  const levels = [
+    ...stamps.map((x) => ({ seniority: x.seniority, j: { rank_name: x.rank_name, stamped: true, admin: !x.rank_id, user_name: x.user_name, created_at: x.created_at, comment: x.comment } })),
+    ...pending.map((c) => ({ seniority: c.seniority, j: { rank_name: c.name, stamped: false } })),
+    ...(r.reviewed_at && !stamps.length ? [{ seniority: 0, j: { rank_name: '查閱', stamped: true, admin: false, user_name: r.reviewer_name, created_at: r.reviewed_at, comment: r.review_comment } }] : []),
+  ].sort((a, b) => a.seniority - b.seniority).map((x) => x.j);
+  return { r, stamps, complete: Boolean(r.reviewed_at), levels, next: pending[0] || null, top: stamps.length ? stamps[stamps.length - 1] : null };
+}
+function reviewStatesFor(ids, uid) {
+  const me = profileOf(uid);
+  return ids.map((id) => db.reports.find((x) => x.id === id)).filter((r) => r
+    && ((r.user_id === uid && me.active) || (r.status === 'submitted' && canViewUser(uid, r.user_id))))
+    .map((r) => {
+      const st = reviewState(r.id);
+      return {
+        report_id: r.id, complete: st.complete, levels: st.levels, next_rank_name: st.next ? st.next.name : null,
+        can_stamp: !st.complete && r.status === 'submitted' && Boolean(st.next) && st.next.id === me.rank_id && userCanView(uid, r.user_id),
+        can_withdraw: !isAdminUser(uid) && ((st.stamps.length && st.top.user_id === uid) || (!st.stamps.length && st.complete && r.reviewed_by === uid)),
+        is_admin: isAdminUser(uid),
+      };
+    });
 }
 // 與 schema.sql 的 RLS 政策相同的可見範圍
 function visible(table, uid) {
@@ -78,17 +130,17 @@ function visible(table, uid) {
   const ok = me && me.active;
   switch (table) {
     case 'departments': return ok ? db.departments : [];
-    case 'profiles': return db.profiles.filter((p) => p.id === uid || canReviewDept(uid, p.department_id))
-      .map((p) => ({ ...p, department: deptOf(p.department_id) }));
+    case 'ranks': return ok ? db.ranks : [];
+    case 'profiles': return db.profiles.filter((p) => p.id === uid || canViewUser(uid, p.id))
+      .map((p) => ({ ...p, department: deptOf(p.department_id), rank: rankOf(p.rank_id) }));
     case 'manager_departments': return db.manager_departments.filter((m) => (m.user_id === uid && ok) || (ok && me.role === 'admin'));
-    case 'reports': return db.reports.filter((r) => (r.user_id === uid && ok) || (r.status === 'submitted' && canReviewDept(uid, profileOf(r.user_id).department_id)))
-      .map((r) => { const a = profileOf(r.user_id); return { ...r, author: { name: a.name, role: a.role, department_id: a.department_id, department: deptOf(a.department_id) } }; });
+    case 'reports': return db.reports.filter((r) => (r.user_id === uid && ok) || (r.status === 'submitted' && canViewUser(uid, r.user_id)))
+      .map((r) => { const a = profileOf(r.user_id); return { ...r, author: { name: a.name, role: a.role, department_id: a.department_id, department: deptOf(a.department_id), rank: rankOf(a.rank_id) } }; });
     case 'meeting_minutes': return ok ? db.meeting_minutes.filter((m) => canReviewDept(uid, m.department_id)
       || (me.department_id === m.department_id && (m.published_at || m.recorder_id === uid))) : [];
     case 'review_logs': return db.review_logs.filter((l) => visible('reports', uid).some((r) => r.id === l.report_id));
-    // 與 schema.sql 相同：自己部門；主管另含負責部門；管理員全部
-    case 'customers': return ok ? db.customers.filter((c) => me.role === 'admin' || c.department_id === me.department_id
-      || (me.role === 'manager' && db.manager_departments.some((m) => m.user_id === uid && m.department_id === c.department_id))) : [];
+    // 與 schema.sql 相同：所屬部門＋額外可查閱部門；管理員全部
+    case 'customers': return ok ? db.customers.filter((c) => me.role === 'admin' || scopeOf(uid).includes(c.department_id)) : [];
     default: return [];
   }
 }
@@ -159,17 +211,68 @@ function rpc(fn, args, uid) {
       db.reports.push({ id, user_id: uid, week_start: args.p_week, work_summary: args.p_work_summary, daily_work: args.p_daily_work, daily_entries: args.p_daily_entries || [], customer_visits: args.p_customer_visits, sales_progress: args.p_sales_progress, next_week_plan: args.p_next_week_plan, issues: args.p_issues, status: args.p_submit ? 'submitted' : 'draft', submitted_at: args.p_submit ? now : null, updated_at: now, reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
       return id;
     }
+    case 'report_review_states': return reviewStatesFor(args.p_ids, uid);
     case 'review_report': {
       const r = db.reports.find((x) => x.id === args.p_id);
-      if (args.p_action === 'review') Object.assign(r, { reviewed_at: now, reviewed_by: uid, reviewer_name: me.name, review_comment: args.p_comment });
-      if (args.p_action === 'unreview') Object.assign(r, { reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
-      db.review_logs.push({ id: db.review_logs.length + 1, report_id: r.id, user_name: me.name, action: args.p_action === 'review' ? 'reviewed' : 'unreviewed', comment: args.p_comment, created_at: now });
+      if (!r || r.status !== 'submitted' || r.user_id === uid || !canViewUser(uid, r.user_id)) throw new RpcError('週報不存在，或您沒有權限查閱。');
+      const st = reviewState(r.id);
+      const admin = isAdminUser(uid);
+      const comment = (args.p_comment || '').trim();
+      if (args.p_action === 'review') {
+        if (st.complete) throw new RpcError('這份週報已完成核閱。');
+        if (!admin && (!st.next || st.next.id !== me.rank_id)) throw new RpcError(st.next ? `目前輪到「${st.next.name}」核閱，請等前一層級完成後再核閱。` : '這份週報沒有其他可核閱的層級，請由系統管理員代為完成核閱。');
+        const rank = admin ? null : rankOf(me.rank_id);
+        db.report_stamps.push({ report_id: r.id, rank_id: rank ? rank.id : null, rank_name: rank ? rank.name : '系統管理員', seniority: rank ? rank.seniority : 1e6, user_id: uid, user_name: me.name, comment, created_at: now });
+        if (comment) r.review_comment = comment;
+        if (admin || !reviewState(r.id).next) Object.assign(r, { reviewed_at: now, reviewed_by: uid, reviewer_name: me.name });
+      } else if (args.p_action === 'unreview') {
+        if (admin) db.report_stamps = db.report_stamps.filter((x) => x.report_id !== r.id);
+        else if (st.top && st.top.user_id === uid) db.report_stamps = db.report_stamps.filter((x) => x !== st.top);
+        else throw new RpcError('只能撤回自己的核閱，而且上一層級還沒有核閱。');
+        Object.assign(r, { reviewed_at: null, reviewed_by: null, reviewer_name: '' });
+      } else if (args.p_action === 'comment') {
+        const mine = st.stamps.find((x) => x.user_id === uid);
+        if (!comment) throw new RpcError('請輸入主管意見。');
+        if (!mine) throw new RpcError('請先核閱，再更新意見。');
+        mine.comment = comment;
+        r.review_comment = comment;
+      }
+      db.review_logs.push({ id: db.review_logs.length + 1, report_id: r.id, user_name: me.name, action: { review: 'reviewed', unreview: 'unreviewed', comment: 'commented' }[args.p_action], comment, created_at: now });
       return null;
     }
     case 'change_my_password': me.must_change_password = false; return null;
     case 'admin_save_user': return args.p_id || '00000000-0000-4000-8000-0000000000ff';
     case 'admin_save_department': return 9;
-    case 'review_reports': return 0;
+    case 'review_reports': {
+      let n = 0;
+      for (const id of args.p_ids) {
+        const [st] = reviewStatesFor([id], uid);
+        if (st && (st.can_stamp || (st.is_admin && !st.complete))) { rpc('review_report', { p_id: id, p_action: 'review', p_comment: '' }, uid); n += 1; }
+      }
+      return n;
+    }
+    case 'admin_save_rank': {
+      if (!isAdminUser(uid)) throw new RpcError('沒有權限。');
+      const name = args.p_name.trim();
+      if (db.ranks.some((r) => r.name === name && r.id !== args.p_id)) throw new RpcError('職級名稱已存在。');
+      if (args.p_id) { Object.assign(db.ranks.find((r) => r.id === args.p_id), { name, is_manager: args.p_is_manager }); return args.p_id; }
+      const id = Math.max(...db.ranks.map((r) => r.id)) + 1;
+      db.ranks.push({ id, name, seniority: Math.min(...db.ranks.map((r) => r.seniority)) - 10, is_manager: args.p_is_manager });
+      return id;
+    }
+    case 'admin_move_rank': {
+      const sorted = [...db.ranks].sort((a, b) => a.seniority - b.seniority);
+      const i = sorted.findIndex((r) => r.id === args.p_id);
+      const other = sorted[i + (args.p_up ? 1 : -1)];
+      if (!other) throw new RpcError(args.p_up ? '已經是最高職級。' : '已經是最低職級。');
+      [sorted[i].seniority, other.seniority] = [other.seniority, sorted[i].seniority];
+      return null;
+    }
+    case 'admin_delete_rank': {
+      if (db.profiles.some((p) => p.rank_id === args.p_id)) throw new RpcError('仍有人員是這個職級，請先調整這些人員的職級。');
+      db.ranks = db.ranks.filter((r) => r.id !== args.p_id);
+      return null;
+    }
     case 'save_customer': {
       const name = args.p_name.trim();
       const terms = [name, ...args.p_aliases].map((t) => t.toLowerCase());
@@ -187,8 +290,7 @@ function rpc(fn, args, uid) {
     case 'admin_delete_customer': {
       const c = visible('customers', uid).find((x) => x.id === args.p_id);
       if (!c) throw new RpcError('客戶不存在。');
-      const canEdit = me.role === 'admin' || (me.role === 'manager' && db.manager_departments.some((m) => m.user_id === uid && m.department_id === c.department_id));
-      if (!canEdit) throw new RpcError('只有負責這個部門的主管或系統管理員可以刪除客戶。');
+      if (!canReviewDept(uid, c.department_id)) throw new RpcError('只有具主管權限的職級或系統管理員可以刪除客戶。');
       db.customers = db.customers.filter((x) => x.id !== args.p_id);
       return null;
     }
@@ -355,7 +457,7 @@ test('未登入導向登入頁、密碼錯誤顯示訊息', async () => {
   await ctx.close();
 });
 
-test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () => {
+test('主管：查閱名單 → 檢視週報 → 核閱', async () => {
   const page = await login('boss');
   await page.waitForSelector('.stats');
   assert.match(page.url(), /#\/review$/);
@@ -364,8 +466,10 @@ test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () =
   assert.match(body, /陳小明/);
   assert.doesNotMatch(body, /黃大偉/, '其他部門人員不應出現');
 
-  await page.goto(base + '#/review?week=all&status=pending');
+  assert.match(await page.textContent('.pending-pill'), /待我核閱：1 份/);
+  await page.goto(base + '#/review?week=all&status=mine');
   await page.waitForSelector('a.btn-sm[href^="#/reports/1"]');
+  assert.match(await page.textContent('tbody tr'), /陳小明\s*專員[\s\S]*待我核閱/);
   assert.match(await page.textContent('td.summary'), /^一：拜訪大成科技/);
   await page.click('a.btn-sm[href^="#/reports/1"]');
   await page.waitForSelector('[data-review]');
@@ -373,13 +477,19 @@ test('主管：查閱名單 → 檢視週報 → 標記查閱完成', async () =
   assert.match(await page.textContent('.report-body'), /<script>alert\(1\)<\/script>/);
   assert.strictEqual(await page.$('.report-body script'), null);
   assert.match(await page.textContent('.daily-view'), /週三[\s\S]*完成長興報價[\s\S]*週六[\s\S]*週六展覽/);
+  // 簽核欄：輪到經理（虛線圈）
+  assert.match(await page.textContent('.signoff'), /經理\s*待核閱/);
+  assert.match(await page.textContent('[data-review] button.btn-primary'), /核閱（經理）/);
 
   await page.fill('textarea[name=comment]', '做得好');
   await page.click('button[value=review]');
   await page.waitForSelector('.review-box.is-reviewed');
-  assert.match(await page.textContent('.alert-success'), /查閱完成/);
-  assert.match(await page.textContent('.timeline'), /王經理 標記查閱完成/);
-  assert.deepStrictEqual(rpcCalls.at(-1), { fn: 'review_report', args: { p_id: 1, p_action: 'review', p_comment: '做得好' }, uid: U.boss });
+  assert.match(await page.textContent('.alert-success'), /已完成核閱/);
+  assert.match(await page.textContent('.signoff .seal'), /經理[\s\S]*王經理/);
+  assert.match(await page.textContent('.timeline'), /王經理 核閱：做得好/);
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'review_report').at(-1), { fn: 'review_report', args: { p_id: 1, p_action: 'review', p_comment: '做得好' }, uid: U.boss });
+  // 核閱後：只能撤回或更新自己的意見
+  assert.ok(await page.$('[data-review] button[value=unreview]'));
   await shot(page, 'ui-report-view');
   await page.context().close();
 });
@@ -422,8 +532,7 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   await shot(page, 'ui-daily-form');
   await page.click('button[value=submit]');
   await page.waitForSelector('.report-body');
-  const call = rpcCalls.at(-1);
-  assert.strictEqual(call.fn, 'save_report');
+  const call = rpcCalls.filter((c) => c.fn === 'save_report').at(-1);
   const only = (content) => [{ customer: '', contact: '', content }];
   assert.deepStrictEqual({ p_id: call.args.p_id, p_week: call.args.p_week, p_submit: call.args.p_submit, p_work_summary: call.args.p_work_summary, p_daily_entries: call.args.p_daily_entries },
     { p_id: null, p_week: THIS_WEEK, p_submit: true, p_work_summary: '',
@@ -434,11 +543,10 @@ test('業務：看到查閱結果、填寫本週週報並提交', async () => {
   assert.match(view, /週日[\s\S]*週日拜訪/);
   assert.doesNotMatch(view, /週六/);
   await shot(page, 'd-entries-view');
-  assert.match(await page.textContent('main'), /待查閱/);
+  assert.match(await page.textContent('main'), /待核閱/);
 
   await page.goto(base + '#/admin/users');
-  await page.waitForSelector('h1');
-  assert.match(await page.textContent('h1'), /權限不足/);
+  await page.waitForSelector('h1:has-text("權限不足")');
   await page.context().close();
 });
 
@@ -478,9 +586,9 @@ test('繳交統計：管理員看全部部門、數字正確', async () => {
     return [c[1].textContent.trim(), c.slice(2, 6).map((td) => (td.querySelector('.cell') || {}).className.replace('cell ', '').trim()), c[6].textContent.trim(), c[7].textContent.trim()];
   }));
   assert.deepStrictEqual(people, [
-    ['陳小明', ['cell-bad', 'cell-bad', 'cell-ok late', 'cell-warn'], '2／4', '50%'],
-    ['王經理 主管', ['cell-bad', 'cell-bad', 'cell-bad', 'cell-muted'], '0／3', '0%'],
-    ['黃大偉', ['cell-na', 'cell-na', 'cell-na', 'cell-muted'], '0／0', '—'],
+    ['王經理 經理', ['cell-bad', 'cell-bad', 'cell-bad', 'cell-muted'], '0／3', '0%'],
+    ['陳小明 專員', ['cell-bad', 'cell-bad', 'cell-ok late', 'cell-warn'], '2／4', '50%'],
+    ['黃大偉 專員', ['cell-na', 'cell-na', 'cell-na', 'cell-muted'], '0／0', '—'],
   ]);
   assert.match(await page.textContent('.stats'), /應繳份數[\s\S]*29%[\s\S]*未繳份數/);
   await shot(page, 'd-stats');
@@ -514,8 +622,7 @@ test('繳交統計：主管只看到自己負責的部門；業務人員不能�
   await staff.waitForSelector('.highlight');
   assert.strictEqual(await staff.$('a[href="#/stats"]'), null);
   await staff.goto(base + '#/stats');
-  await staff.waitForSelector('h1');
-  assert.match(await staff.textContent('h1'), /權限不足/);
+  await staff.waitForSelector('h1:has-text("權限不足")');
   await staff.context().close();
 });
 
@@ -546,7 +653,7 @@ test('列印：單份週報與整週批次列印、輸出 PDF', async () => {
   await page.click('a[href^="#/print"]');
   await page.waitForSelector('h1:has-text("列印週報")');
   assert.strictEqual(await page.$$eval('.print-report', (a) => a.length), 1);
-  assert.match(await page.textContent('.print-report'), /陳小明 的週報[\s\S]*拜訪大成科技[\s\S]*已查閱完成/);
+  assert.match(await page.textContent('.print-report'), /陳小明 的週報[\s\S]*經理[\s\S]*王經理[\s\S]*拜訪大成科技[\s\S]*已完成核閱/);
   const pdf2 = await page.pdf({ path: path.join(process.env.SHOT_DIR || '/tmp', 'sample-batch.pdf'), preferCSSPageSize: true, printBackground: true });
   assert.strictEqual(pdf2.subarray(0, 4).toString(), '%PDF');
   await page.context().close();
@@ -704,19 +811,63 @@ test('管理員：人員列表、人員表單、部門管理', async () => {
   for (const n of ['王經理', '陳小明', '黃大偉', '系統管理員']) assert.match(text, new RegExp(n));
   await shot(page, 'ui-users');
 
+  assert.match(text, /王經理[\s\S]*經理[\s\S]*陳小明[\s\S]*專員/);
+
+  // 人員表單：帳號類型＋職級＋額外可查閱部門
   await page.click(`a[href="#/admin/users/${U.boss}"]`);
-  await page.waitForSelector('[data-managed]');
-  assert.strictEqual(await page.isVisible('[data-managed]'), true);
-  assert.strictEqual(await page.isChecked('input[name=managed][value="1"]'), true);
-  await page.selectOption('select[name=role]', 'staff');
-  assert.strictEqual(await page.isVisible('[data-managed]'), false);
-  await page.selectOption('select[name=role]', 'manager');
+  await page.waitForSelector('select[name=rank_id]');
+  assert.strictEqual(await page.inputValue('select[name=role]'), 'user');
+  assert.strictEqual(await page.inputValue('select[name=rank_id]'), '2');
+  assert.deepStrictEqual(await page.$$eval('select[name=rank_id] option', (o) => o.map((x) => x.textContent)),
+    ['協理（主管權限）', '經理（主管權限）', '副理', '主任', '副主任', '專員']);
+  assert.strictEqual(await page.isChecked('input[name=managed][value="2"]'), false);
+  await page.selectOption('select[name=role]', 'admin');
+  assert.strictEqual(await page.isVisible('select[name=rank_id]'), false);
+  assert.strictEqual(await page.isVisible('input[name=managed][value="2"]'), false);
+  await page.selectOption('select[name=role]', 'user');
+  await page.selectOption('select[name=rank_id]', '1');
   await page.check('input[name=managed][value="2"]');
   await page.click('form[data-form] button.btn-primary');
   await page.waitForSelector('.alert-success');
-  const call = rpcCalls.at(-1);
-  assert.strictEqual(call.fn, 'admin_save_user');
-  assert.deepStrictEqual(call.args, { p_id: U.boss, p_username: 'boss', p_name: '王經理', p_role: 'manager', p_department_id: 1, p_managed: [1, 2], p_active: true, p_password: '' });
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_save_user').at(-1).args,
+    { p_id: U.boss, p_username: 'boss', p_name: '王經理', p_role: 'user', p_rank_id: 1, p_department_id: 1, p_extra_depts: [2], p_active: true, p_password: '' });
+
+  // 職級管理（每個動作前先清掉舊訊息，確認等到的是這次動作的結果）
+  const act = async (fn) => {
+    await page.evaluate(() => document.querySelectorAll('.alert').forEach((e) => e.remove()));
+    await fn();
+    await page.waitForSelector('.alert-success');
+  };
+  const rankNames = () => page.$$eval('[data-rank] input[name=name]', (i) => i.map((x) => x.value));
+  await page.click('a[href="#/admin/ranks"]');
+  await page.waitForSelector('[data-rank]');
+  assert.deepStrictEqual(await rankNames(), ['協理', '經理', '副理', '主任', '副主任', '專員']);
+  assert.strictEqual(await page.isDisabled('[data-move="1"][data-up="1"]'), true, '最高職級不能再調高');
+  assert.strictEqual(await page.isDisabled('[data-del-rank="2"]'), true, '有人員的職級不能刪除');
+  await act(() => page.click('[data-move="3"][data-up="1"]'));
+  assert.deepStrictEqual(await rankNames(), ['協理', '副理', '經理', '主任', '副主任', '專員']);
+  await act(() => page.click('[data-move="3"][data-up="0"]'));
+  assert.deepStrictEqual(await rankNames(), ['協理', '經理', '副理', '主任', '副主任', '專員']);
+  await act(async () => {
+    await page.fill('[data-rank="4"] input[name=name]', '資深主任');
+    await page.check('[data-rank="4"] input[name=is_manager]');
+    await page.click('[data-rank="4"] button');
+  });
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_save_rank').at(-1).args, { p_id: 4, p_name: '資深主任', p_is_manager: true });
+  await act(async () => {
+    await page.fill('[data-create] input[name=name]', '實習生');
+    await page.click('[data-create] button');
+  });
+  assert.strictEqual((await rankNames()).at(-1), '實習生');
+  await act(() => page.click('[data-del-rank="7"]'));
+  assert.strictEqual(await page.$('[data-rank="7"]'), null);
+  await shot(page, 'd-ranks');
+  // 還原名稱與主管權限，避免影響後續測試
+  await act(async () => {
+    await page.fill('[data-rank="4"] input[name=name]', '主任');
+    await page.uncheck('[data-rank="4"] input[name=is_manager]');
+    await page.click('[data-rank="4"] button');
+  });
 
   await page.click('a[href="#/admin/departments"]');
   await page.waitForSelector('[data-create]');
@@ -725,7 +876,7 @@ test('管理員：人員列表、人員表單、部門管理', async () => {
   await page.fill('[data-create] input[name=name]', '東區業務部');
   await page.click('[data-create] button');
   await page.waitForSelector('.alert-success');
-  assert.deepStrictEqual(rpcCalls.at(-1).args, { p_id: null, p_name: '東區業務部' });
+  assert.deepStrictEqual(rpcCalls.filter((c) => c.fn === 'admin_save_department').at(-1).args, { p_id: null, p_name: '東區業務部' });
   await page.context().close();
 });
 
@@ -789,6 +940,79 @@ test('週會紀錄：登打、調整順序、記錄人續編、發布與週次�
     await boss.context().close();
     await amy.context().close();
   }
+});
+
+test('逐級核閱：副理 → 經理依序蓋章，作者在核閱後不能編輯', async () => {
+  // 北區加一位副理；陳小明新的一週週報
+  const deputy = '00000000-0000-4000-8000-0000000000de';
+  db.profiles.push({ id: deputy, username: 'deputy', name: '李副理', role: 'user', rank_id: 3, department_id: 1, active: true, must_change_password: false, created_at: '2026-01-01T00:00:00Z' });
+  const WEEK2 = addDaysStr(LAST_WEEK, -7);
+  const rid = Math.max(...db.reports.map((x) => x.id)) + 1;
+  db.reports.push({ id: rid, user_id: U.amy, week_start: WEEK2, work_summary: '', daily_work: ['拜訪客戶', '', '', '', '', '', ''], daily_entries: [],
+    customer_visits: '', sales_progress: '', next_week_plan: '', issues: '', status: 'submitted', submitted_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(), reviewed_at: null, reviewed_by: null, reviewer_name: '', review_comment: '' });
+  const levelsText = (page) => page.$$eval('.signoff-levels li', (li) => li.map((x) => x.textContent.replace(/\s+/g, '')));
+
+  // 經理：還沒輪到（等副理）
+  const boss = await login('boss');
+  await boss.waitForSelector('.stats');
+  await boss.goto(base + `#/reports/${rid}`);
+  await boss.waitForSelector('.signoff');
+  assert.deepStrictEqual(await levelsText(boss), ['副理待核閱', '經理待核閱']);
+  assert.strictEqual(await boss.$('[data-review]'), null, '還沒輪到經理');
+  assert.match(await boss.textContent('.review-box'), /目前輪到：副理/);
+
+  // 副理核閱
+  const dep = await login('deputy');
+  await dep.waitForSelector('.stats');
+  await dep.goto(base + `#/reports/${rid}`);
+  await dep.waitForSelector('[data-review]');
+  await dep.fill('textarea[name=comment]', '請補充報價');
+  await dep.click('button[value=review]');
+  await dep.waitForSelector('.alert-success');
+  const after = await levelsText(dep);
+  assert.match(after[0], /^副理.*李副理$/);
+  assert.strictEqual(after[1], '經理待核閱');
+  assert.ok(await dep.$('button[value=unreview]'), '副理可撤回自己的核閱');
+  assert.match(await dep.textContent('.stamp-comments'), /副理 李副理：請補充報價/);
+
+  // 作者：核閱中，不能再編輯
+  const amy = await login('amy');
+  await amy.waitForSelector('.highlight');
+  await amy.goto(base + `#/reports/${rid}`);
+  await amy.waitForSelector('.signoff');
+  assert.match(await amy.textContent('h1'), /核閱中/);
+  assert.strictEqual(await amy.$('a[href$="/edit"]'), null);
+  await amy.goto(base + '#/reports');
+  await amy.waitForSelector('table');
+  assert.match(await amy.textContent('table'), /核閱中\s*1\/2[\s\S]*輪到 經理/);
+
+  // 經理核閱 → 完成
+  await boss.goto(base + '#/review?week=all&status=mine');
+  await boss.waitForSelector(`a.btn-sm[href^="#/reports/${rid}"]`);
+  await boss.click(`a.btn-sm[href^="#/reports/${rid}"]`);
+  await boss.waitForSelector('[data-review] button.btn-primary');
+  await boss.click('[data-review] button.btn-primary');
+  await boss.waitForSelector('.review-box.is-reviewed');
+  const done = await levelsText(boss);
+  assert.strictEqual(done.length, 2);
+  assert.match(done[1], /^經理.*王經理$/);
+  await shot(boss, 'd-signoff');
+
+  // 副理：上一層已核閱，不能再撤回
+  await dep.goto(base + `#/reports/${rid}?back=/review`);
+  await dep.waitForSelector('.review-box.is-reviewed');
+  assert.strictEqual(await dep.$('button[value=unreview]'), null);
+
+  // 系統管理員：撤回全部核閱
+  const adm = await login('admin');
+  await adm.waitForSelector('.stats');
+  await adm.goto(base + `#/reports/${rid}`);
+  await adm.waitForSelector('[data-review]');
+  await adm.click('button[value=unreview]'); // 登入時已設定自動確認
+  await adm.waitForSelector('.alert-success');
+  assert.deepStrictEqual(await levelsText(adm), ['副理待核閱', '經理待核閱']);
+  for (const p of [boss, dep, amy, adm]) await p.context().close();
 });
 
 test('全程沒有 JavaScript 錯誤', () => {

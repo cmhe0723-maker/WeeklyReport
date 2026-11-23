@@ -46,29 +46,66 @@ create table if not exists public.departments (
 );
 comment on table public.departments is '部門';
 
+-- 職級：seniority 越大職級越高；高職級可查閱同部門（或額外可查閱部門）職級較低的人員。
+-- is_manager（主管權限）：可管理所屬及額外可查閱部門的客戶名錄、週會紀錄
+create table if not exists public.ranks (
+  id          bigint      generated always as identity primary key,
+  name        text        not null check (char_length(btrim(name)) between 1 and 20),
+  seniority   integer     not null,
+  is_manager  boolean     not null default false,
+  created_at  timestamptz not null default now(),
+  constraint ranks_name_key unique (name),
+  constraint ranks_seniority_key unique (seniority) deferrable initially immediate
+);
+comment on table  public.ranks            is '職級（由系統管理員設定）';
+comment on column public.ranks.seniority  is '數字越大職級越高';
+comment on column public.ranks.is_manager is '主管權限：管理客戶名錄、週會紀錄';
+insert into public.ranks (name, seniority, is_manager)
+select v.name, v.seniority, v.is_manager
+from (values ('協理', 60, true), ('經理', 50, true), ('副理', 40, false),
+             ('主任', 30, false), ('副主任', 20, false), ('專員', 10, false)) as v(name, seniority, is_manager)
+where not exists (select 1 from public.ranks);
+
 -- 人員資料（對應 Supabase Auth 的 auth.users）
 create table if not exists public.profiles (
   id                   uuid        primary key references auth.users (id) on delete cascade,
   username             text        not null check (username ~ '^[A-Za-z0-9._-]{3,50}$'),
   name                 text        not null check (char_length(btrim(name)) between 1 and 50),
-  role                 text        not null check (role in ('admin', 'manager', 'staff')),
+  role                 text        not null check (role in ('admin', 'user')),
+  rank_id              bigint      references public.ranks (id) on delete restrict,
   department_id        bigint      references public.departments (id) on delete set null,
   active               boolean     not null default true,
   must_change_password boolean     not null default false,
   created_at           timestamptz not null default now()
 );
 comment on table  public.profiles      is '人員資料與角色';
-comment on column public.profiles.role is 'admin=系統管理員, manager=主管, staff=業務人員';
+comment on column public.profiles.role is 'admin=系統管理員, user=一般人員（依職級決定查閱範圍）';
 create unique index if not exists profiles_username_lower_key on public.profiles (lower(username));
 create index if not exists profiles_department_id_idx on public.profiles (department_id);
 
--- 主管可查閱的部門（一位主管可負責多個部門）
+-- 舊版角色轉換（只會對尚未轉換的帳號生效）：主管 → 經理（最低的主管權限職級）、業務人員 → 專員（最低職級）
+alter table public.profiles add column if not exists rank_id bigint references public.ranks (id) on delete restrict;
+alter table public.profiles drop constraint if exists profiles_role_check;
+update public.profiles p
+   set rank_id = coalesce(p.rank_id, (select r.id from public.ranks r where r.is_manager order by r.seniority limit 1)),
+       role = 'user'
+ where p.role = 'manager';
+update public.profiles p
+   set rank_id = coalesce(p.rank_id, (select r.id from public.ranks r order by r.seniority limit 1)),
+       role = 'user'
+ where p.role = 'staff';
+alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'user'));
+alter table public.profiles drop constraint if exists profiles_rank_chk;
+alter table public.profiles add constraint profiles_rank_chk check (role = 'admin' or rank_id is not null);
+create index if not exists profiles_rank_id_idx on public.profiles (rank_id);
+
+-- 額外可查閱的部門：在這些部門裡同樣可查閱職級較低的人員（例如一位協理同時負責兩個部門）
 create table if not exists public.manager_departments (
   user_id       uuid   not null references public.profiles (id)    on delete cascade,
   department_id bigint not null references public.departments (id) on delete cascade,
   primary key (user_id, department_id)
 );
-comment on table public.manager_departments is '主管可查閱的部門';
+comment on table public.manager_departments is '額外可查閱的部門';
 create index if not exists manager_departments_department_id_idx on public.manager_departments (department_id);
 
 -- 週報（每人每週一份，week_start 為該週週一）
@@ -134,6 +171,24 @@ comment on table public.review_logs is '週報查閱歷程';
 create index if not exists review_logs_report_id_idx on public.review_logs (report_id, id desc);
 create index if not exists review_logs_user_id_idx   on public.review_logs (user_id);
 
+-- 逐級核閱：每個職級一個章（同一層級有多人時，任一人核閱即可）。
+-- rank_id 為 null 表示系統管理員代為完成核閱。seniority、rank_name 為核閱當時的快照
+create table if not exists public.report_stamps (
+  id         bigint      generated always as identity primary key,
+  report_id  bigint      not null references public.reports (id) on delete cascade,
+  rank_id    bigint      references public.ranks (id) on delete set null,
+  rank_name  text        not null,
+  seniority  integer     not null,
+  user_id    uuid        references public.profiles (id) on delete set null,
+  user_name  text        not null default '',
+  comment    text        not null default '' check (char_length(comment) <= 2000),
+  created_at timestamptz not null default now()
+);
+comment on table public.report_stamps is '週報逐級核閱紀錄（每個職級一個章）';
+create unique index if not exists report_stamps_rank_key  on public.report_stamps (report_id, rank_id) where rank_id is not null;
+create unique index if not exists report_stamps_admin_key on public.report_stamps (report_id) where rank_id is null;
+create index if not exists report_stamps_report_idx on public.report_stamps (report_id, seniority);
+
 -- 週報內容變更時自動更新 updated_at
 create or replace function private.set_updated_at()
 returns trigger language plpgsql set search_path = '' as $$
@@ -169,16 +224,62 @@ returns boolean language sql stable security definer set search_path = '' as $$
   select coalesce(private.my_role() = 'admin', false)
 $$;
 
--- 目前登入者能否查閱某部門的週報：管理員全部可以；主管限負責的部門
+-- 目前登入者的職級高低（系統管理員、停用時為 null）
+create or replace function private.my_seniority()
+returns integer language sql stable security definer set search_path = '' as $$
+  select r.seniority from public.profiles p join public.ranks r on r.id = p.rank_id
+  where p.id = auth.uid() and p.active and p.role = 'user'
+$$;
+
+-- 目前登入者是否有主管權限（管理客戶名錄、週會紀錄）
+create or replace function private.my_is_manager()
+returns boolean language sql stable security definer set search_path = '' as $$
+  select coalesce((select r.is_manager from public.profiles p join public.ranks r on r.id = p.rank_id
+                   where p.id = auth.uid() and p.active and p.role = 'user'), false)
+$$;
+
+-- 目前登入者涵蓋的部門：所屬部門＋額外可查閱部門
+create or replace function private.my_scope_depts()
+returns bigint[] language sql stable security definer set search_path = '' as $$
+  select coalesce(array(
+    select p.department_id from public.profiles p
+    where p.id = auth.uid() and p.active and p.department_id is not null
+    union
+    select md.department_id from public.manager_departments md join public.profiles p on p.id = md.user_id
+    where md.user_id = auth.uid() and p.active
+  ), '{}')
+$$;
+
+-- 某人（viewer）能否查閱另一人（target）：target 在 viewer 的所屬或額外可查閱部門，且職級較低
+create or replace function private.user_can_view(p_viewer uuid, p_target uuid)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select exists (
+    select 1
+    from public.profiles v
+    join public.ranks vr on vr.id = v.rank_id
+    join public.profiles t on t.id = p_target
+    join public.ranks tr on tr.id = t.rank_id
+    where v.id = p_viewer and v.active and v.role = 'user'
+      and t.role = 'user' and t.id <> v.id and t.department_id is not null
+      and tr.seniority < vr.seniority
+      and (t.department_id = v.department_id
+           or exists (select 1 from public.manager_departments md
+                      where md.user_id = v.id and md.department_id = t.department_id))
+  )
+$$;
+
+-- 目前登入者能否查閱某人：系統管理員全部；其他人依職級
+create or replace function private.can_view_user(p_target uuid)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select private.is_admin() or private.user_can_view(auth.uid(), p_target)
+$$;
+
+-- 目前登入者能否管理某部門（客戶名錄、週會紀錄）：系統管理員；或有主管權限且為所屬／額外可查閱部門
 create or replace function private.can_review_dept(p_department_id bigint)
 returns boolean language sql stable security definer set search_path = '' as $$
   select private.is_admin()
-      or (p_department_id is not null and exists (
-            select 1
-            from public.manager_departments md
-            join public.profiles p on p.id = md.user_id
-            where md.user_id = auth.uid() and p.active and p.role = 'manager'
-              and md.department_id = p_department_id))
+      or (p_department_id is not null and private.my_is_manager()
+          and p_department_id = any (private.my_scope_depts()))
 $$;
 
 -- 某位人員的所屬部門
@@ -221,17 +322,30 @@ alter table public.profiles            enable row level security;
 alter table public.manager_departments enable row level security;
 alter table public.reports             enable row level security;
 alter table public.review_logs         enable row level security;
+alter table public.ranks               enable row level security;
+alter table public.report_stamps       enable row level security;
+
+drop policy if exists ranks_select on public.ranks;
+create policy ranks_select on public.ranks
+  for select to authenticated
+  using (private.my_role() is not null);
+
+-- 看得到週報才看得到核閱章
+drop policy if exists report_stamps_select on public.report_stamps;
+create policy report_stamps_select on public.report_stamps
+  for select to authenticated
+  using (exists (select 1 from public.reports r where r.id = report_id));
 
 drop policy if exists departments_select on public.departments;
 create policy departments_select on public.departments
   for select to authenticated
   using (private.my_role() is not null);
 
--- 自己、管理員、或負責該部門的主管
+-- 自己、系統管理員、或同部門（含額外可查閱部門）職級較高的人
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles
   for select to authenticated
-  using (id = (select auth.uid()) or private.can_review_dept(department_id));
+  using (id = (select auth.uid()) or private.can_view_user(id));
 
 drop policy if exists manager_departments_select on public.manager_departments;
 create policy manager_departments_select on public.manager_departments
@@ -244,7 +358,7 @@ create policy reports_select on public.reports
   for select to authenticated
   using (
     (user_id = (select auth.uid()) and private.my_role() is not null)
-    or (status = 'submitted' and private.can_review_dept(private.user_dept(user_id)))
+    or (status = 'submitted' and private.can_view_user(user_id))
   );
 
 -- 看得到週報才看得到其查閱歷程
@@ -254,10 +368,10 @@ create policy review_logs_select on public.review_logs
   using (exists (select 1 from public.reports r where r.id = report_id));
 
 revoke all on public.departments, public.profiles, public.manager_departments,
-              public.reports, public.review_logs
+              public.reports, public.review_logs, public.ranks, public.report_stamps
   from anon, authenticated;
 grant select on public.departments, public.profiles, public.manager_departments,
-                public.reports, public.review_logs
+                public.reports, public.review_logs, public.ranks, public.report_stamps
   to authenticated;
 
 -- =============================================================================
@@ -302,7 +416,7 @@ declare
   v_content text;
   i         integer;
 begin
-  if v_role is null or v_role not in ('staff', 'manager') then
+  if v_role is distinct from 'user' then
     raise exception '沒有權限填寫週報。';
   end if;
   p_work_summary    := btrim(coalesce(p_work_summary, ''));
@@ -387,8 +501,8 @@ begin
     if not found then
       raise exception '週報不存在。';
     end if;
-    if v_old.reviewed_at is not null then
-      raise exception '此週報主管已查閱，無法再修改。如需修改請洽主管撤回查閱。';
+    if v_old.reviewed_at is not null or exists (select 1 from public.report_stamps where report_id = p_id) then
+      raise exception '此週報已有主管核閱，無法再修改。如需修改請洽主管撤回核閱。';
     end if;
     update public.reports set
       work_summary    = p_work_summary,
@@ -463,35 +577,154 @@ end;
 $$;
 
 -- =============================================================================
--- RPC：主管查閱
+-- RPC：逐級核閱
+--   核閱層級＝能查閱作者的在職人員所屬職級（由低到高，同層級任一人核閱即可）。
+--   必須由低到高依序核閱；所有層級都核閱後才算「已查閱」（reports.reviewed_at）。
+--   有任何核閱章後作者不能再修改；只能撤回自己的章，且上一層級尚未核閱。
+--   系統管理員可代為完成核閱、或撤回全部核閱（避免層級無人時卡住）。
 -- =============================================================================
 
--- p_action：review = 標記查閱完成、unreview = 撤回查閱、comment = 只更新意見
+-- 某位作者週報的核閱層級（由低到高）
+create or replace function private.review_chain(p_author uuid)
+returns table (rank_id bigint, rank_name text, seniority integer)
+language sql stable security definer set search_path = '' as $$
+  select distinct r.id, r.name, r.seniority
+  from public.profiles v join public.ranks r on r.id = v.rank_id
+  where v.active and v.role = 'user' and private.user_can_view(v.id, p_author)
+  order by r.seniority
+$$;
+
+-- 單一週報的核閱狀態
+create or replace function private.review_state(p_report_id bigint)
+returns table (author_id uuid, status text, complete boolean, levels jsonb,
+               next_rank_id bigint, next_rank_name text, top_user uuid, has_stamps boolean, reviewed_by uuid)
+language sql stable security definer set search_path = '' as $$
+  with r as (select * from public.reports where id = p_report_id),
+  s as (select * from public.report_stamps where report_id = p_report_id),
+  mx as (select max(seniority) filter (where rank_id is not null) as top from s),
+  p as (
+    select c.rank_id, c.rank_name, c.seniority
+    from r cross join mx cross join lateral private.review_chain(r.user_id) as c
+    where r.reviewed_at is null and r.status = 'submitted'
+      and not exists (select 1 from s where s.rank_id = c.rank_id)
+      and c.seniority > coalesce(mx.top, -2147483648)
+  ),
+  lv as (
+    select s.seniority, jsonb_build_object('rank_name', s.rank_name, 'stamped', true, 'admin', s.rank_id is null,
+           'user_name', s.user_name, 'created_at', s.created_at, 'comment', s.comment) as j
+    from s
+    union all
+    select p.seniority, jsonb_build_object('rank_name', p.rank_name, 'stamped', false) from p
+    union all
+    -- 舊版（逐級核閱之前）已查閱的週報：以原查閱人顯示一個章
+    select 0, jsonb_build_object('rank_name', '查閱', 'stamped', true, 'admin', false, 'user_name', r.reviewer_name,
+           'created_at', r.reviewed_at, 'comment', r.review_comment)
+    from r where r.reviewed_at is not null and not exists (select 1 from s)
+  )
+  select r.user_id, r.status, r.reviewed_at is not null,
+         (select coalesce(jsonb_agg(lv.j order by lv.seniority), '[]'::jsonb) from lv),
+         (select p.rank_id from p order by p.seniority limit 1),
+         (select p.rank_name from p order by p.seniority limit 1),
+         (select s.user_id from s order by s.seniority desc limit 1),
+         exists (select 1 from s),
+         r.reviewed_by
+  from r
+$$;
+
+-- 多份週報的核閱狀態與目前登入者可執行的動作（只回傳看得到的週報）
+create or replace function public.report_review_states(p_ids bigint[])
+returns table (report_id bigint, complete boolean, levels jsonb, next_rank_name text,
+               can_stamp boolean, can_withdraw boolean, is_admin boolean)
+language sql stable security definer set search_path = '' as $$
+  select r.id, st.complete, st.levels, st.next_rank_name,
+         coalesce(not st.complete and st.status = 'submitted' and st.next_rank_id is not null
+                  and st.next_rank_id = (select p.rank_id from public.profiles p
+                                         where p.id = auth.uid() and p.active and p.role = 'user')
+                  and private.user_can_view(auth.uid(), r.user_id), false),
+         coalesce(not private.is_admin()
+                  and ((st.has_stamps and st.top_user = auth.uid())
+                       or (not st.has_stamps and st.complete and st.reviewed_by = auth.uid()
+                           and private.can_view_user(r.user_id))), false),
+         private.is_admin()
+  from public.reports r cross join lateral private.review_state(r.id) as st
+  where r.id = any (p_ids)
+    and ((r.user_id = auth.uid() and private.my_role() is not null)
+         or (r.status = 'submitted' and private.can_view_user(r.user_id)))
+$$;
+
+-- p_action：review = 核閱（蓋自己職級的章）、unreview = 撤回自己的核閱（系統管理員：撤回全部）、
+--           comment = 更新自己核閱時的意見
 create or replace function public.review_report(p_id bigint, p_action text, p_comment text)
 returns void language plpgsql security definer set search_path = '' as $$
 declare
   v_r       public.reports;
-  v_name    text;
+  v_st      record;
+  v_me      public.profiles;
+  v_rank    public.ranks;
   v_comment text := left(btrim(coalesce(p_comment, '')), 2000);
+  v_admin   boolean := private.is_admin();
 begin
   select * into v_r from public.reports where id = p_id for update;
-  if not found or v_r.status <> 'submitted' or v_r.user_id = auth.uid()
-     or not private.can_review_dept(private.user_dept(v_r.user_id)) then
+  if not found or v_r.status <> 'submitted' or v_r.user_id = auth.uid() or not private.can_view_user(v_r.user_id) then
     raise exception '週報不存在，或您沒有權限查閱。';
   end if;
-  select name into v_name from public.profiles where id = auth.uid();
+  select * into v_me from public.profiles where id = auth.uid();
+  select * into v_st from private.review_state(p_id);
 
   if p_action = 'review' then
-    update public.reports
-       set reviewed_by = auth.uid(), reviewer_name = v_name, reviewed_at = now(), review_comment = v_comment
-     where id = p_id;
+    if v_st.complete then
+      raise exception '這份週報已完成核閱。';
+    end if;
+    if v_admin then
+      insert into public.report_stamps (report_id, rank_id, rank_name, seniority, user_id, user_name, comment)
+      values (p_id, null, '系統管理員', 1000000, auth.uid(), v_me.name, v_comment);
+    else
+      if v_st.next_rank_id is null then
+        raise exception '這份週報沒有其他可核閱的層級，請由系統管理員代為完成核閱。';
+      end if;
+      if v_st.next_rank_id is distinct from v_me.rank_id then
+        raise exception '目前輪到「%」核閱，請等前一層級完成後再核閱。', v_st.next_rank_name;
+      end if;
+      select * into v_rank from public.ranks where id = v_me.rank_id;
+      insert into public.report_stamps (report_id, rank_id, rank_name, seniority, user_id, user_name, comment)
+      values (p_id, v_rank.id, v_rank.name, v_rank.seniority, auth.uid(), v_me.name, v_comment);
+    end if;
+    if v_comment <> '' then
+      update public.reports set review_comment = v_comment where id = p_id;
+    end if;
+    -- 所有層級都核閱（或系統管理員代為完成）→ 已查閱
+    if v_admin or (select s.next_rank_id from private.review_state(p_id) as s) is null then
+      update public.reports
+         set reviewed_by = auth.uid(), reviewer_name = v_me.name, reviewed_at = now()
+       where id = p_id;
+    end if;
+
   elsif p_action = 'unreview' then
+    if v_admin then
+      delete from public.report_stamps where report_id = p_id;
+    elsif v_st.has_stamps and v_st.top_user = auth.uid() then
+      delete from public.report_stamps
+       where report_id = p_id and user_id = auth.uid()
+         and seniority = (select max(seniority) from public.report_stamps where report_id = p_id);
+    elsif not v_st.has_stamps and v_st.complete and v_r.reviewed_by = auth.uid() then
+      null; -- 舊版已查閱的週報，由原查閱人撤回
+    else
+      raise exception '只能撤回自己的核閱，而且上一層級還沒有核閱。';
+    end if;
     update public.reports
-       set reviewed_by = null, reviewer_name = '', reviewed_at = null, review_comment = ''
+       set reviewed_by = null, reviewer_name = '', reviewed_at = null,
+           review_comment = coalesce((select s.comment from public.report_stamps s
+                                      where s.report_id = p_id and s.comment <> ''
+                                      order by s.seniority desc limit 1), '')
      where id = p_id;
+
   elsif p_action = 'comment' then
     if v_comment = '' then
       raise exception '請輸入主管意見。';
+    end if;
+    update public.report_stamps set comment = v_comment where report_id = p_id and user_id = auth.uid();
+    if not found and not (v_st.complete and not v_st.has_stamps and v_r.reviewed_by = auth.uid()) then
+      raise exception '請先核閱，再更新意見。';
     end if;
     update public.reports set review_comment = v_comment where id = p_id;
   else
@@ -499,37 +732,32 @@ begin
   end if;
 
   insert into public.review_logs (report_id, user_id, user_name, action, comment)
-  values (p_id, auth.uid(), v_name,
+  values (p_id, auth.uid(), v_me.name,
           case p_action when 'review' then 'reviewed' when 'unreview' then 'unreviewed' else 'commented' end,
           v_comment);
 end;
 $$;
 
--- 批次標記查閱完成，回傳實際標記的筆數
+-- 批次核閱：只處理目前輪到自己的週報（系統管理員：代為完成），回傳實際核閱的筆數
 create or replace function public.review_reports(p_ids bigint[])
 returns integer language plpgsql security definer set search_path = '' as $$
 declare
-  v_name text;
-  v_n    integer;
+  v_id bigint;
+  v_n  integer := 0;
 begin
-  if coalesce(private.my_role(), '') not in ('admin', 'manager') then
+  if private.my_role() is null then
     raise exception '沒有權限。';
   end if;
   if coalesce(cardinality(p_ids), 0) > 500 then
-    raise exception '一次最多標記 500 份。';
+    raise exception '一次最多核閱 500 份。';
   end if;
-  select name into v_name from public.profiles where id = auth.uid();
-  with done as (
-    update public.reports r
-       set reviewed_by = auth.uid(), reviewer_name = v_name, reviewed_at = now()
-     where r.id = any (p_ids)
-       and r.status = 'submitted' and r.reviewed_at is null and r.user_id <> auth.uid()
-       and private.can_review_dept(private.user_dept(r.user_id))
-    returning r.id
-  )
-  insert into public.review_logs (report_id, user_id, user_name, action)
-  select id, auth.uid(), v_name, 'reviewed' from done;
-  get diagnostics v_n = row_count;
+  for v_id in select distinct unnest(p_ids) loop
+    if exists (select 1 from public.report_review_states(array[v_id]) s
+               where s.can_stamp or (s.is_admin and not s.complete)) then
+      perform public.review_report(v_id, 'review', '');
+      v_n := v_n + 1;
+    end if;
+  end loop;
   return v_n;
 end;
 $$;
@@ -583,14 +811,18 @@ end;
 $$;
 
 -- 新增（p_id 為 null）或修改人員。p_password 留空表示不變更（新增時必填）。
+-- p_role：admin＝系統管理員、user＝一般人員（需設定職級與所屬部門）
+-- p_extra_depts：額外可查閱的部門（一般人員）
 -- 設定或重設密碼後，該人員下次登入需自行變更密碼。
+drop function if exists public.admin_save_user(uuid, text, text, text, bigint, bigint[], boolean, text);
 create or replace function public.admin_save_user(
   p_id            uuid,
   p_username      text,
   p_name          text,
   p_role          text,
+  p_rank_id       bigint,
   p_department_id bigint,
-  p_managed       bigint[],
+  p_extra_depts   bigint[],
   p_active        boolean,
   p_password      text
 ) returns uuid
@@ -602,12 +834,12 @@ begin
   if not private.is_admin() then
     raise exception '沒有權限。';
   end if;
-  p_username := btrim(coalesce(p_username, ''));
-  p_name     := btrim(coalesce(p_name, ''));
-  p_password := coalesce(p_password, '');
-  p_active   := coalesce(p_active, true);
-  p_managed  := coalesce(p_managed, '{}');
-  v_email    := private.login_email(p_username);
+  p_username    := btrim(coalesce(p_username, ''));
+  p_name        := btrim(coalesce(p_name, ''));
+  p_password    := coalesce(p_password, '');
+  p_active      := coalesce(p_active, true);
+  p_extra_depts := coalesce(p_extra_depts, '{}');
+  v_email       := private.login_email(p_username);
 
   if p_username !~ '^[A-Za-z0-9._-]{3,50}$' then
     raise exception '帳號需為 3–50 個英數字或 . _ - 符號。';
@@ -615,17 +847,22 @@ begin
   if p_name = '' or char_length(p_name) > 50 then
     raise exception '請輸入姓名（50 字以內）。';
   end if;
-  if p_role is null or p_role not in ('admin', 'manager', 'staff') then
-    raise exception '角色不正確。';
+  if p_role is null or p_role not in ('admin', 'user') then
+    raise exception '帳號類型不正確。';
   end if;
-  if p_role <> 'admin' and p_department_id is null then
-    raise exception '請選擇所屬部門。';
+  if p_role = 'user' then
+    if p_rank_id is null or not exists (select 1 from public.ranks where id = p_rank_id) then
+      raise exception '請選擇職級。';
+    end if;
+    if p_department_id is null then
+      raise exception '請選擇所屬部門。';
+    end if;
+  else
+    p_rank_id := null;
+    p_extra_depts := '{}';
   end if;
   if p_department_id is not null and not exists (select 1 from public.departments where id = p_department_id) then
     raise exception '所屬部門不存在。';
-  end if;
-  if p_role = 'manager' and cardinality(p_managed) = 0 then
-    raise exception '主管至少需設定一個可查閱的部門。';
   end if;
   if p_id is null and char_length(p_password) < 8 then
     raise exception '初始密碼至少需 8 個字元。';
@@ -640,8 +877,8 @@ begin
 
   if p_id is null then
     v_id := private.create_auth_user(v_email, p_password);
-    insert into public.profiles (id, username, name, role, department_id, active, must_change_password)
-    values (v_id, p_username, p_name, p_role, p_department_id, p_active, true);
+    insert into public.profiles (id, username, name, role, rank_id, department_id, active, must_change_password)
+    values (v_id, p_username, p_name, p_role, p_rank_id, p_department_id, p_active, true);
     if not p_active then
       update auth.users set banned_until = '2999-12-31 00:00:00+00' where id = v_id;
     end if;
@@ -653,8 +890,8 @@ begin
       raise exception '不可停用自己的帳號或移除自己的管理員權限。';
     end if;
     update public.profiles
-       set username = p_username, name = p_name, role = p_role, department_id = p_department_id,
-           active = p_active,
+       set username = p_username, name = p_name, role = p_role, rank_id = p_rank_id,
+           department_id = p_department_id, active = p_active,
            must_change_password = must_change_password or p_password <> ''
      where id = p_id;
     update auth.users
@@ -679,12 +916,87 @@ begin
   end if;
 
   delete from public.manager_departments where user_id = v_id;
-  if p_role = 'manager' then
-    insert into public.manager_departments (user_id, department_id)
-    select v_id, d.id from public.departments d where d.id = any (p_managed)
-    on conflict do nothing;
+  insert into public.manager_departments (user_id, department_id)
+  select v_id, d.id from public.departments d
+  where d.id = any (p_extra_depts) and d.id is distinct from p_department_id
+  on conflict do nothing;
+  return v_id;
+end;
+$$;
+
+-- 新增（p_id 為 null）或修改職級名稱與主管權限；新增的職級排在最低，可再用 admin_move_rank 調整
+create or replace function public.admin_save_rank(p_id bigint, p_name text, p_is_manager boolean)
+returns bigint language plpgsql security definer set search_path = '' as $$
+declare
+  v_id bigint;
+begin
+  if not private.is_admin() then
+    raise exception '沒有權限。';
+  end if;
+  p_name := btrim(coalesce(p_name, ''));
+  if p_name = '' or char_length(p_name) > 20 then
+    raise exception '職級名稱需為 1–20 個字。';
+  end if;
+  if exists (select 1 from public.ranks where name = p_name and id is distinct from p_id) then
+    raise exception '職級名稱已存在。';
+  end if;
+  if p_id is null then
+    insert into public.ranks (name, seniority, is_manager)
+    values (p_name, coalesce((select min(seniority) from public.ranks), 20) - 10, coalesce(p_is_manager, false))
+    returning id into v_id;
+  else
+    update public.ranks set name = p_name, is_manager = coalesce(p_is_manager, is_manager)
+     where id = p_id returning id into v_id;
+    if v_id is null then
+      raise exception '職級不存在。';
+    end if;
   end if;
   return v_id;
+end;
+$$;
+
+-- 調整職級高低：與上一級（p_up = true）或下一級交換位置
+create or replace function public.admin_move_rank(p_id bigint, p_up boolean)
+returns void language plpgsql security definer set search_path = '' as $$
+declare
+  v_me    public.ranks;
+  v_other public.ranks;
+begin
+  if not private.is_admin() then
+    raise exception '沒有權限。';
+  end if;
+  select * into v_me from public.ranks where id = p_id for update;
+  if not found then
+    raise exception '職級不存在。';
+  end if;
+  if p_up then
+    select * into v_other from public.ranks where seniority > v_me.seniority order by seniority limit 1 for update;
+  else
+    select * into v_other from public.ranks where seniority < v_me.seniority order by seniority desc limit 1 for update;
+  end if;
+  if not found then
+    raise exception '%', case when p_up then '已經是最高職級。' else '已經是最低職級。' end;
+  end if;
+  set constraints public.ranks_seniority_key deferred;
+  update public.ranks set seniority = v_other.seniority where id = v_me.id;
+  update public.ranks set seniority = v_me.seniority where id = v_other.id;
+  set constraints public.ranks_seniority_key immediate;
+end;
+$$;
+
+create or replace function public.admin_delete_rank(p_id bigint)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if not private.is_admin() then
+    raise exception '沒有權限。';
+  end if;
+  if exists (select 1 from public.profiles where rank_id = p_id) then
+    raise exception '仍有人員是這個職級，請先調整這些人員的職級。';
+  end if;
+  delete from public.ranks where id = p_id;
+  if not found then
+    raise exception '職級不存在。';
+  end if;
 end;
 $$;
 
@@ -728,17 +1040,17 @@ returns bigint language sql stable security definer set search_path = '' as $$
   select p.department_id from public.profiles p where p.id = auth.uid() and p.active
 $$;
 
--- 看得到（也可以新增）某部門的客戶名錄
+-- 看得到（也可以新增）某部門的客戶名錄：所屬部門、額外可查閱部門；系統管理員全部
 create or replace function private.can_view_customers(p_department_id bigint)
 returns boolean language sql stable security definer set search_path = '' as $$
   select private.my_role() is not null
-     and (private.can_review_dept(p_department_id) or p_department_id = private.my_dept())
+     and (private.is_admin() or p_department_id = any (private.my_scope_depts()))
 $$;
 
--- 可以修改／停用某部門的客戶
+-- 可以修改／停用／刪除某部門的客戶：有主管權限的職級（所屬及額外可查閱部門）、系統管理員
 create or replace function private.can_edit_customers(p_department_id bigint)
 returns boolean language sql stable security definer set search_path = '' as $$
-  select coalesce(private.my_role() in ('admin', 'manager'), false) and private.can_review_dept(p_department_id)
+  select private.can_review_dept(p_department_id)
 $$;
 
 alter table public.customers enable row level security;
@@ -749,7 +1061,7 @@ create policy customers_select on public.customers
 revoke all on public.customers from anon, authenticated;
 grant select on public.customers to authenticated;
 
--- 新增（p_id 為 null）或修改客戶。業務人員只能新增；修改、停用需主管或系統管理員
+-- 新增（p_id 為 null）或修改客戶。一般人員可新增；修改、停用需有主管權限的職級或系統管理員
 -- p_contacts：聯絡人清單；修改時傳 null 表示不變更
 drop function if exists public.save_customer(bigint, bigint, text, text[], boolean);
 create or replace function public.save_customer(
@@ -819,7 +1131,7 @@ begin
       raise exception '客戶不存在。';
     end if;
     if not (private.can_edit_customers(v_old.department_id) and private.can_edit_customers(p_department_id)) then
-      raise exception '只有主管或系統管理員可以修改客戶名錄。';
+      raise exception '只有具主管權限的職級或系統管理員可以修改客戶名錄。';
     end if;
   end if;
 
@@ -860,7 +1172,7 @@ begin
     raise exception '客戶不存在。';
   end if;
   if not private.can_edit_customers(v_dept) then
-    raise exception '只有負責這個部門的主管或系統管理員可以刪除客戶。';
+    raise exception '只有具主管權限的職級或系統管理員可以刪除客戶。';
   end if;
   delete from public.customers where id = p_id;
 end;
@@ -1086,7 +1398,8 @@ begin
       'save_report', 'delete_draft', 'change_my_password', 'review_report', 'review_reports',
       'admin_save_department', 'admin_delete_department', 'admin_save_user',
       'meeting_roster', 'save_meeting_minutes',
-      'save_customer', 'customer_mentions', 'customer_records', 'customer_stats', 'admin_delete_customer')
+      'save_customer', 'customer_mentions', 'customer_records', 'customer_stats', 'admin_delete_customer',
+      'report_review_states', 'admin_save_rank', 'admin_move_rank', 'admin_delete_rank')
   loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
@@ -1103,7 +1416,8 @@ $$;
 -- RLS 政策會呼叫這些函式，因此登入者需要執行權限（函式本身只回傳自己的權限判斷）
 grant execute on function private.my_role(), private.is_admin(),
                           private.can_review_dept(bigint), private.user_dept(uuid),
-                          private.my_dept(), private.can_view_customers(bigint)
+                          private.my_dept(), private.can_view_customers(bigint),
+                          private.can_view_user(uuid)
   to authenticated;
 
 -- =============================================================================
