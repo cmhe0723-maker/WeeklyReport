@@ -548,3 +548,69 @@ test('職級管理：只有系統管理員可以新增、改名、調整、刪�
   assert.strictEqual((await sys('select name, is_manager from ranks where id = $1', [depRank]))[0].name, '副理（測試）');
   await as(admin, "select public.admin_save_rank($1, '副理', null)", [depRank]);
 });
+
+test('逐級核閱：人員與職級異動、刪除職級、每人只能核閱一層、待我核閱', async () => {
+  const dF = await as(admin, "select public.admin_save_department(null, '異動測試部') as id").then((r) => r[0].id);
+  const mk = (username, name, rank, extra = {}) => rpcUser(admin, { username, name, role: 'user', rank, dept: dF, password: 'pass12345', ...extra });
+  const tmpRank = await as(admin, "select public.admin_save_rank(null, '臨時職', false) as id").then((r) => r[0].id);
+  await as(admin, 'select public.admin_move_rank($1, true)', [tmpRank]); // 移到專員之上
+  const S = await mk('f_staff', '專員丙', '專員');
+  const T = await mk('f_tmp', '臨時丙', '臨時職');
+  const G = await mk('f_dep', '副理丙', '副理');
+  const M = await mk('f_mgr', '經理丙', '經理');
+  const V = await mk('f_vp', '協理丙', '協理');
+  const state = (uid, rep) => as(uid, 'select * from public.report_review_states($1)', [[rep]]).then((r) => r[0]);
+  const review = (uid, rep, action = 'review') => as(uid, 'select public.review_report($1, $2, $3)', [rep, action, '']);
+  const levels = async (rep) => (await state(admin, rep)).levels.map((l) => `${l.rank_name}:${l.stamped ? l.user_name : '待核閱'}${l.admin ? '(管理員)' : ''}`);
+  const queue = (uid) => as(uid, 'select public.my_review_queue() as id').then((r) => r.map((x) => Number(x.id)));
+
+  const rid = await save(S, null, '2027-02-01', '異動測試', true);
+  assert.deepStrictEqual(await levels(rid), ['臨時職:待核閱', '副理:待核閱', '經理:待核閱', '協理:待核閱']);
+  await review(T, rid);
+
+  // 每人只能核閱一層：臨時丙升為副理後不能再蓋副理的章
+  await mk('f_tmp', '臨時丙', '副理', { id: T });
+  assert.strictEqual((await state(T, rid)).can_stamp, false);
+  assert.strictEqual((await state(G, rid)).can_stamp, true);
+  await assert.rejects(review(T, rid), /已核閱過這份週報/);
+  await review(G, rid);
+
+  // 刪除職級：原章保留（不會變成系統管理員代閱），也不影響下一層
+  await as(admin, 'select public.admin_delete_rank($1)', [tmpRank]);
+  assert.deepStrictEqual(await levels(rid), ['臨時職:臨時丙', '副理:副理丙', '經理:待核閱', '協理:待核閱']);
+  assert.strictEqual((await state(M, rid)).can_stamp, true);
+
+  // 待我核閱：輪到經理；系統管理員只有需要代為完成的週報，批次核閱也不會跳過層級
+  assert.ok((await queue(M)).includes(Number(rid)));
+  assert.ok(!(await queue(V)).includes(Number(rid)));
+  assert.ok(!(await queue(admin)).includes(Number(rid)));
+  assert.strictEqual(await as(admin, 'select public.review_reports($1) as n', [[rid]]).then((r) => r[0].n), 0);
+  assert.strictEqual((await sys('select count(*)::int as n from report_stamps where report_id = $1', [rid]))[0].n, 2);
+  const ridV = await save(V, null, '2027-02-01', '協理的週報', true);
+  assert.ok((await queue(admin)).includes(Number(ridV)), '沒有上級的週報在系統管理員的待我核閱');
+  assert.strictEqual(await as(admin, 'select public.review_reports($1) as n', [[ridV]]).then((r) => r[0].n), 1);
+
+  // 剩下的層級沒有在職人員 → 自動完成核閱
+  await review(M, rid);
+  assert.strictEqual((await state(admin, rid)).complete, false);
+  await mk('f_vp', '協理丙', '協理', { id: V, active: false });
+  const [fin] = await sys('select reviewed_at is not null as ok, reviewer_name from reports where id = $1', [rid]);
+  assert.deepStrictEqual(fin, { ok: true, reviewer_name: '經理丙' });
+  await mk('f_vp', '協理丙', '協理', { id: V });
+
+  // 調整職級高低：核閱章的層級跟著調整
+  const rid2 = await save(S, null, '2027-02-08', '第二週', true);
+  await review(G, rid2);
+  const [{ id: depRank, seniority: depSen }] = await sys("select id, seniority from ranks where name = '副理'");
+  const [{ seniority: chiefSen }] = await sys("select seniority from ranks where name = '主任'");
+  await as(admin, 'select public.admin_move_rank($1, false)', [depRank]);
+  assert.strictEqual((await sys('select seniority from report_stamps where report_id = $1', [rid2]))[0].seniority, chiefSen);
+  await as(admin, 'select public.admin_move_rank($1, true)', [depRank]);
+  assert.strictEqual((await sys('select seniority from report_stamps where report_id = $1', [rid2]))[0].seniority, depSen);
+  assert.deepStrictEqual(await levels(rid2), ['副理:副理丙', '經理:待核閱', '協理:待核閱']);
+
+  // 沒有所屬部門不能填寫週報
+  await sys('update profiles set department_id = null where id = $1', [S]);
+  await assert.rejects(save(S, null, '2027-02-15', '沒有部門', true), /尚未設定所屬部門/);
+  await sys('update profiles set department_id = $2 where id = $1', [S, dF]);
+});

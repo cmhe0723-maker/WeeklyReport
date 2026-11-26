@@ -387,7 +387,8 @@
   function reviewRowState(r, st) {
     const base = reportState(r);
     if (base !== 'pending') return base;
-    if (st && (st.can_stamp || (st.is_admin && !st.complete))) return 'mine';
+    // 系統管理員：只有沒有層級可核閱、需要代為完成的週報才算「待我核閱」
+    if (st && (st.can_stamp || (st.is_admin && !st.complete && !st.next_rank_name))) return 'mine';
     return 'progress';
   }
   function badge(state) {
@@ -597,6 +598,7 @@
           <button class="btn btn-primary">填寫週報</button>
         </form>
       </div>
+      ${me.department_id ? '' : '<div class="alert alert-warning">您尚未設定所屬部門，無法提交週報，請洽系統管理員設定。</div>'}
       <section class="card highlight"><div class="row-between">
         <div><div class="muted small">本週</div><strong>${weekLabel(thisWeek)}</strong></div>
         ${cur ? `<div class="row-gap">${stateHtml(cur)}<a class="btn" href="#/reports/${cur.id}">查看</a></div>`
@@ -932,10 +934,7 @@
     const link = (o) => '#/review' + qs({ week: week || 'all', dept: deptFilter || '', status, ...o });
 
     // 待我核閱（所有週次）
-    const openReports = await fetchAll(() => sb.from('reports').select('id')
-      .eq('status', 'submitted').is('reviewed_at', null).neq('user_id', me.id).order('id'));
-    const openStates = await reviewStates(openReports.map((r) => r.id));
-    const myTurn = [...openStates.values()].filter((st) => st.can_stamp || (st.is_admin && !st.complete)).length;
+    const myTurn = must(await sb.rpc('my_review_queue')).length;
 
     const author = 'author:profiles!reports_user_id_fkey!inner(name, role, department_id, rank:ranks(name, seniority))';
     let rows = [];
