@@ -100,11 +100,11 @@ function reviewChain(author) {
 function reviewState(rid) {
   const r = db.reports.find((x) => x.id === rid);
   const stamps = db.report_stamps.filter((x) => x.report_id === rid).sort((a, b) => a.seniority - b.seniority);
-  const top = Math.max(-Infinity, ...stamps.filter((x) => x.rank_id).map((x) => x.seniority));
+  const top = Math.max(-Infinity, ...stamps.filter((x) => !x.is_admin).map((x) => x.seniority));
   const pending = r.reviewed_at || r.status !== 'submitted' ? [] : reviewChain(r.user_id)
     .filter((c) => !stamps.some((x) => x.rank_id === c.id) && c.seniority > top);
   const levels = [
-    ...stamps.map((x) => ({ seniority: x.seniority, j: { rank_name: x.rank_name, stamped: true, admin: !x.rank_id, user_name: x.user_name, created_at: x.created_at, comment: x.comment } })),
+    ...stamps.map((x) => ({ seniority: x.seniority, j: { rank_name: x.rank_name, stamped: true, admin: Boolean(x.is_admin), user_name: x.user_name, created_at: x.created_at, comment: x.comment } })),
     ...pending.map((c) => ({ seniority: c.seniority, j: { rank_name: c.name, stamped: false } })),
     ...(r.reviewed_at && !stamps.length ? [{ seniority: 0, j: { rank_name: '查閱', stamped: true, admin: false, user_name: r.reviewer_name, created_at: r.reviewed_at, comment: r.review_comment } }] : []),
   ].sort((a, b) => a.seniority - b.seniority).map((x) => x.j);
@@ -118,7 +118,7 @@ function reviewStatesFor(ids, uid) {
       const st = reviewState(r.id);
       return {
         report_id: r.id, complete: st.complete, levels: st.levels, next_rank_name: st.next ? st.next.name : null,
-        can_stamp: !st.complete && r.status === 'submitted' && Boolean(st.next) && st.next.id === me.rank_id && userCanView(uid, r.user_id),
+        can_stamp: !st.complete && r.status === 'submitted' && Boolean(st.next) && st.next.id === me.rank_id && userCanView(uid, r.user_id) && !st.stamps.some((x) => x.user_id === uid),
         can_withdraw: !isAdminUser(uid) && ((st.stamps.length && st.top.user_id === uid) || (!st.stamps.length && st.complete && r.reviewed_by === uid)),
         is_admin: isAdminUser(uid),
       };
@@ -212,6 +212,8 @@ function rpc(fn, args, uid) {
       return id;
     }
     case 'report_review_states': return reviewStatesFor(args.p_ids, uid);
+    case 'my_review_queue': return reviewStatesFor(db.reports.filter((r) => r.status === 'submitted' && !r.reviewed_at && r.user_id !== uid).map((r) => r.id), uid)
+      .filter((st) => st.can_stamp || (st.is_admin && !st.complete && !st.next_rank_name)).map((st) => st.report_id);
     case 'review_report': {
       const r = db.reports.find((x) => x.id === args.p_id);
       if (!r || r.status !== 'submitted' || r.user_id === uid || !canViewUser(uid, r.user_id)) throw new RpcError('週報不存在，或您沒有權限查閱。');
@@ -221,8 +223,9 @@ function rpc(fn, args, uid) {
       if (args.p_action === 'review') {
         if (st.complete) throw new RpcError('這份週報已完成核閱。');
         if (!admin && (!st.next || st.next.id !== me.rank_id)) throw new RpcError(st.next ? `目前輪到「${st.next.name}」核閱，請等前一層級完成後再核閱。` : '這份週報沒有其他可核閱的層級，請由系統管理員代為完成核閱。');
+        if (!admin && st.stamps.some((x) => x.user_id === uid)) throw new RpcError('您已核閱過這份週報（每人只能核閱一個層級）。');
         const rank = admin ? null : rankOf(me.rank_id);
-        db.report_stamps.push({ report_id: r.id, rank_id: rank ? rank.id : null, rank_name: rank ? rank.name : '系統管理員', seniority: rank ? rank.seniority : 1e6, user_id: uid, user_name: me.name, comment, created_at: now });
+        db.report_stamps.push({ report_id: r.id, rank_id: rank ? rank.id : null, is_admin: admin, rank_name: rank ? rank.name : '系統管理員', seniority: rank ? rank.seniority : 1e6, user_id: uid, user_name: me.name, comment, created_at: now });
         if (comment) r.review_comment = comment;
         if (admin || !reviewState(r.id).next) Object.assign(r, { reviewed_at: now, reviewed_by: uid, reviewer_name: me.name });
       } else if (args.p_action === 'unreview') {
@@ -247,7 +250,7 @@ function rpc(fn, args, uid) {
       let n = 0;
       for (const id of args.p_ids) {
         const [st] = reviewStatesFor([id], uid);
-        if (st && (st.can_stamp || (st.is_admin && !st.complete))) { rpc('review_report', { p_id: id, p_action: 'review', p_comment: '' }, uid); n += 1; }
+        if (st && (st.can_stamp || (st.is_admin && !st.complete && !st.next_rank_name))) { rpc('review_report', { p_id: id, p_action: 'review', p_comment: '' }, uid); n += 1; }
       }
       return n;
     }

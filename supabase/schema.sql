@@ -108,6 +108,14 @@ create table if not exists public.manager_departments (
 comment on table public.manager_departments is '額外可查閱的部門';
 create index if not exists manager_departments_department_id_idx on public.manager_departments (department_id);
 
+-- 沒有所屬部門的一般人員（舊版主管）：以第一個額外可查閱部門作為所屬部門
+update public.profiles p
+   set department_id = (select min(md.department_id) from public.manager_departments md where md.user_id = p.id)
+ where p.role = 'user' and p.department_id is null
+   and exists (select 1 from public.manager_departments md where md.user_id = p.id);
+delete from public.manager_departments md using public.profiles p
+ where p.id = md.user_id and md.department_id = p.department_id;
+
 -- 週報（每人每週一份，week_start 為該週週一）
 create table if not exists public.reports (
   id              bigint generated always as identity primary key,
@@ -172,11 +180,13 @@ create index if not exists review_logs_report_id_idx on public.review_logs (repo
 create index if not exists review_logs_user_id_idx   on public.review_logs (user_id);
 
 -- 逐級核閱：每個職級一個章（同一層級有多人時，任一人核閱即可）。
--- rank_id 為 null 表示系統管理員代為完成核閱。seniority、rank_name 為核閱當時的快照
+-- is_admin 表示系統管理員代為完成核閱。rank_name、seniority 為核閱時的職級（調整職級高低時一併更新；
+-- 職級被刪除後 rank_id 為 null，仍保留原章）
 create table if not exists public.report_stamps (
   id         bigint      generated always as identity primary key,
   report_id  bigint      not null references public.reports (id) on delete cascade,
   rank_id    bigint      references public.ranks (id) on delete set null,
+  is_admin   boolean     not null default false,
   rank_name  text        not null,
   seniority  integer     not null,
   user_id    uuid        references public.profiles (id) on delete set null,
@@ -186,7 +196,10 @@ create table if not exists public.report_stamps (
 );
 comment on table public.report_stamps is '週報逐級核閱紀錄（每個職級一個章）';
 create unique index if not exists report_stamps_rank_key  on public.report_stamps (report_id, rank_id) where rank_id is not null;
-create unique index if not exists report_stamps_admin_key on public.report_stamps (report_id) where rank_id is null;
+alter table public.report_stamps add column if not exists is_admin boolean not null default false;
+update public.report_stamps set is_admin = true where rank_id is null and seniority = 1000000 and not is_admin;
+drop index if exists public.report_stamps_admin_key;
+create unique index report_stamps_admin_key on public.report_stamps (report_id) where is_admin;
 create index if not exists report_stamps_report_idx on public.report_stamps (report_id, seniority);
 
 -- 週報內容變更時自動更新 updated_at
@@ -419,6 +432,9 @@ begin
   if v_role is distinct from 'user' then
     raise exception '沒有權限填寫週報。';
   end if;
+  if private.my_dept() is null then
+    raise exception '您尚未設定所屬部門，請洽系統管理員設定後再填寫週報。';
+  end if;
   p_work_summary    := btrim(coalesce(p_work_summary, ''));
   p_customer_visits := btrim(coalesce(p_customer_visits, ''));
   p_sales_progress  := btrim(coalesce(p_sales_progress, ''));
@@ -601,7 +617,7 @@ returns table (author_id uuid, status text, complete boolean, levels jsonb,
 language sql stable security definer set search_path = '' as $$
   with r as (select * from public.reports where id = p_report_id),
   s as (select * from public.report_stamps where report_id = p_report_id),
-  mx as (select max(seniority) filter (where rank_id is not null) as top from s),
+  mx as (select max(seniority) filter (where not is_admin) as top from s),
   p as (
     select c.rank_id, c.rank_name, c.seniority
     from r cross join mx cross join lateral private.review_chain(r.user_id) as c
@@ -610,7 +626,7 @@ language sql stable security definer set search_path = '' as $$
       and c.seniority > coalesce(mx.top, -2147483648)
   ),
   lv as (
-    select s.seniority, jsonb_build_object('rank_name', s.rank_name, 'stamped', true, 'admin', s.rank_id is null,
+    select s.seniority, jsonb_build_object('rank_name', s.rank_name, 'stamped', true, 'admin', s.is_admin,
            'user_name', s.user_name, 'created_at', s.created_at, 'comment', s.comment) as j
     from s
     union all
@@ -640,7 +656,8 @@ language sql stable security definer set search_path = '' as $$
          coalesce(not st.complete and st.status = 'submitted' and st.next_rank_id is not null
                   and st.next_rank_id = (select p.rank_id from public.profiles p
                                          where p.id = auth.uid() and p.active and p.role = 'user')
-                  and private.user_can_view(auth.uid(), r.user_id), false),
+                  and private.user_can_view(auth.uid(), r.user_id)
+                  and not exists (select 1 from public.report_stamps x where x.report_id = r.id and x.user_id = auth.uid()), false),
          coalesce(not private.is_admin()
                   and ((st.has_stamps and st.top_user = auth.uid())
                        or (not st.has_stamps and st.complete and st.reviewed_by = auth.uid()
@@ -676,14 +693,17 @@ begin
       raise exception '這份週報已完成核閱。';
     end if;
     if v_admin then
-      insert into public.report_stamps (report_id, rank_id, rank_name, seniority, user_id, user_name, comment)
-      values (p_id, null, '系統管理員', 1000000, auth.uid(), v_me.name, v_comment);
+      insert into public.report_stamps (report_id, rank_id, is_admin, rank_name, seniority, user_id, user_name, comment)
+      values (p_id, null, true, '系統管理員', 1000000, auth.uid(), v_me.name, v_comment);
     else
       if v_st.next_rank_id is null then
         raise exception '這份週報沒有其他可核閱的層級，請由系統管理員代為完成核閱。';
       end if;
       if v_st.next_rank_id is distinct from v_me.rank_id then
         raise exception '目前輪到「%」核閱，請等前一層級完成後再核閱。', v_st.next_rank_name;
+      end if;
+      if exists (select 1 from public.report_stamps where report_id = p_id and user_id = auth.uid()) then
+        raise exception '您已核閱過這份週報（每人只能核閱一個層級）。';
       end if;
       select * into v_rank from public.ranks where id = v_me.rank_id;
       insert into public.report_stamps (report_id, rank_id, rank_name, seniority, user_id, user_name, comment)
@@ -738,7 +758,7 @@ begin
 end;
 $$;
 
--- 批次核閱：只處理目前輪到自己的週報（系統管理員：代為完成），回傳實際核閱的筆數
+-- 批次核閱：只處理目前輪到自己的週報（系統管理員：只處理沒有層級可核閱、需代為完成的週報），回傳實際核閱的筆數
 create or replace function public.review_reports(p_ids bigint[])
 returns integer language plpgsql security definer set search_path = '' as $$
 declare
@@ -753,12 +773,39 @@ begin
   end if;
   for v_id in select distinct unnest(p_ids) loop
     if exists (select 1 from public.report_review_states(array[v_id]) s
-               where s.can_stamp or (s.is_admin and not s.complete)) then
+               where s.can_stamp or (s.is_admin and not s.complete and s.next_rank_name is null)) then
       perform public.review_report(v_id, 'review', '');
       v_n := v_n + 1;
     end if;
   end loop;
   return v_n;
+end;
+$$;
+
+-- 待我核閱的週報 id：輪到自己職級的週報；系統管理員為需要代為完成的週報（沒有層級可核閱）
+create or replace function public.my_review_queue()
+returns setof bigint language sql stable security definer set search_path = '' as $$
+  select s.report_id
+  from public.report_review_states(array(
+    select r.id from public.reports r
+    where r.status = 'submitted' and r.reviewed_at is null and r.user_id <> auth.uid()
+  )) as s
+  where s.can_stamp or (s.is_admin and not s.complete and s.next_rank_name is null)
+  order by s.report_id
+$$;
+
+-- 人員、職級異動後：已有核閱章、但後面已沒有層級可核閱的週報，自動完成核閱（以最後核閱的人為查閱人）
+create or replace function private.finalize_reviews()
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  update public.reports r
+     set reviewed_by = t.user_id, reviewer_name = t.user_name, reviewed_at = now()
+    from (select distinct on (s.report_id) s.report_id, s.user_id, s.user_name
+          from public.report_stamps s join public.reports x on x.id = s.report_id
+          where x.status = 'submitted' and x.reviewed_at is null and not s.is_admin
+          order by s.report_id, s.seniority desc) as t
+   where r.id = t.report_id
+     and (select st.next_rank_id from private.review_state(r.id) as st) is null;
 end;
 $$;
 
@@ -920,6 +967,7 @@ begin
   select v_id, d.id from public.departments d
   where d.id = any (p_extra_depts) and d.id is distinct from p_department_id
   on conflict do nothing;
+  perform private.finalize_reviews();
   return v_id;
 end;
 $$;
@@ -981,6 +1029,11 @@ begin
   update public.ranks set seniority = v_other.seniority where id = v_me.id;
   update public.ranks set seniority = v_me.seniority where id = v_other.id;
   set constraints public.ranks_seniority_key immediate;
+  -- 核閱章的層級高低跟著調整，核閱順序才會一致
+  update public.report_stamps
+     set seniority = case when rank_id = v_me.id then v_other.seniority else v_me.seniority end
+   where rank_id in (v_me.id, v_other.id);
+  perform private.finalize_reviews();
 end;
 $$;
 
@@ -997,6 +1050,7 @@ begin
   if not found then
     raise exception '職級不存在。';
   end if;
+  perform private.finalize_reviews();
 end;
 $$;
 
@@ -1399,7 +1453,7 @@ begin
       'admin_save_department', 'admin_delete_department', 'admin_save_user',
       'meeting_roster', 'save_meeting_minutes',
       'save_customer', 'customer_mentions', 'customer_records', 'customer_stats', 'admin_delete_customer',
-      'report_review_states', 'admin_save_rank', 'admin_move_rank', 'admin_delete_rank')
+      'report_review_states', 'my_review_queue', 'admin_save_rank', 'admin_move_rank', 'admin_delete_rank')
   loop
     execute format('revoke all on function %s from public, anon', f);
     execute format('grant execute on function %s to authenticated', f);
